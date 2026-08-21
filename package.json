@@ -1,0 +1,20 @@
+{
+  "name": "my-pi-agent-plugins",
+  "version": "0.1.0",
+  "description": "Custom extensions for the pi coding agent",
+  "repository": "github:josevictorferreira/my-pi-agent-plugins",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "@types/node": "^22",
+    "typebox": "^1",
+    "typescript": "^5"
+  }
+}
