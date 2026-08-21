@@ -6,7 +6,7 @@ Custom extensions for the [pi coding agent](https://github.com/badlogic/pi-mono)
 
 | Plugin | Description |
 | --- | --- |
-| [hindsight](extensions/hindsight/) | Long-term memory tools (`hindsight_recall` / `hindsight_retain`) backed by a [Hindsight](https://github.com/vectorize-io/hindsight) REST API |
+| [hindsight](extensions/hindsight/) | Per-project long-term memory backed by a [Hindsight](https://github.com/vectorize-io/hindsight) REST API: auto-retains your prompts and final responses, `hindsight_recall` tool for search |
 
 ## Install
 

@@ -1,9 +1,19 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentEndEvent,
+  ExtensionAPI,
+  ExtensionContext,
+  InputEvent,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { basename, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 
 const DEFAULT_API_URL = "https://hindsight-api.josevictor.me";
+
+// Auto-retention filters: skip trivial prompts ("ok", "yes", "continue") and
+// cap item size so ingestion stays cheap on very long final responses.
+const MIN_PROMPT_CHARS = 12;
+const MAX_ITEM_CHARS = 8000;
 
 interface RecallResult {
   text: string;
@@ -100,7 +110,67 @@ function errorResult(text: string, status?: number) {
   };
 }
 
+/** Text blocks of a message, joined. Handles string and block-array content. */
+function messageText(message: any): string {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+    .map((block: any) => block.text)
+    .join("\n")
+    .trim();
+}
+
 export default function (pi: ExtensionAPI) {
+  // --- Auto-retention -------------------------------------------------------
+  //
+  // Deterministic ingestion instead of a model-discretion retain tool: only
+  // the user's own prompts and the final assistant response of each agent run
+  // are stored — never intermediate turns, tool calls or tool results. One
+  // async POST per run (extraction happens server-side, asynchronously).
+  const pendingPrompts: string[] = [];
+
+  pi.on("input", async (event: InputEvent) => {
+    const text = event.text.trim();
+    // Extension-injected inputs aren't "my own prompts"; slash commands and
+    // trivial confirmations aren't worth remembering.
+    if (event.source === "extension") return undefined;
+    if (!text || text.startsWith("/") || text.length < MIN_PROMPT_CHARS) return undefined;
+    pendingPrompts.push(text.slice(0, MAX_ITEM_CHARS));
+    return undefined;
+  });
+
+  pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
+    const assistantMessages = event.messages.filter((m: any) => m?.role === "assistant");
+    const finalText = messageText(assistantMessages[assistantMessages.length - 1]);
+
+    const items = pendingPrompts
+      .map((content) => ({ content, context: "user prompt" }))
+      .concat(
+        finalText
+          ? [{ content: finalText.slice(0, MAX_ITEM_CHARS), context: "assistant final response" }]
+          : [],
+      );
+    pendingPrompts.length = 0;
+    if (items.length === 0) return;
+
+    // Fire-and-forget: memory ingestion must never surface as a session error.
+    try {
+      await callApi(
+        "hindsight_auto_retain",
+        deriveBankId(ctx.cwd),
+        "/memories",
+        { items, async: true },
+        undefined,
+      );
+    } catch {
+      // Unreachable (callApi returns errors), but belt-and-braces.
+    }
+  });
+
+  // --- Recall tool ----------------------------------------------------------
+
   pi.registerTool({
     name: "hindsight_recall",
     label: "Recall Memory",
@@ -166,64 +236,6 @@ export default function (pi: ExtensionAPI) {
           },
         ],
         details: { bankId, resultCount: results.length },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "hindsight_retain",
-    label: "Retain Memory",
-    description:
-      "Store information in long-term memory. Use this to remember important " +
-      "facts, user preferences, project context and decisions worth recalling in " +
-      "future sessions. Be specific — include who, what, when and why.",
-    promptSnippet:
-      "hindsight_retain: store a fact in long-term memory for future sessions.",
-    promptGuidelines: [
-      "Call hindsight_retain when you learn something durable — a preference, a " +
-        "convention, a decision and its reason — not for transient task state.",
-    ],
-    parameters: Type.Object({
-      content: Type.String({
-        minLength: 1,
-        description: "The information to remember. Be specific and self-contained.",
-      }),
-      context: Type.Optional(
-        Type.String({
-          description: "Optional context about where this information came from.",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext) {
-      const bankId = deriveBankId(ctx.cwd);
-      const { data, error, status } = await callApi(
-        "hindsight_retain",
-        bankId,
-        "/memories",
-        {
-          items: [
-            {
-              content: params.content,
-              context: params.context,
-            },
-          ],
-          // Synchronous ingestion runs LLM extraction inline and blows past
-          // any sane tool timeout (measured >60s against the live API), so
-          // queue it instead: the memory becomes recallable shortly after.
-          async: true,
-        },
-        signal,
-      );
-      if (error) return errorResult(error, status);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "Memory queued for bank " + bankId + " (extraction runs asynchronously).",
-          },
-        ],
-        details: { bankId, itemsCount: data.items_count ?? 1, operationId: data.operation_id },
       };
     },
   });
