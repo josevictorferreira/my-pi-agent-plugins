@@ -6,7 +6,17 @@ Custom extensions for the [pi coding agent](https://github.com/badlogic/pi-mono)
 
 | Plugin | Description |
 | --- | --- |
+| [codegraph](extensions/codegraph/) | Semantic code search and exploration over a local [CodeGraph](https://github.com/colbymchenry/codegraph) index: `codegraph_explore` returns symbols' source, call paths and blast radius in one call (requires the `codegraph` CLI) |
 | [hindsight](extensions/hindsight/) | Per-project long-term memory backed by a [Hindsight](https://github.com/vectorize-io/hindsight) REST API: auto-retains your prompts and final responses, `hindsight_recall` tool for search |
+| [context7](extensions/context7/) | Up-to-date library documentation from [Context7](https://context7.com): `context7_resolve_library_id` to find a library, `context7_query_docs` to fetch current docs and code examples |
+| [web-tools](extensions/web-tools/) | Web search and URL content extraction via the [Velox](https://velox.josevictor.me/docs) proxy: `web_search` and `web_fetch` tools |
+| [lsp](extensions/lsp/) | Language server integration: compiler errors appended to `edit`/`write` results, plus an `lsp` tool for hover, definitions, references, symbols and diagnostics |
+
+
+## New Plugins
+
+These are the plugins that I plan to add as tools for my pi agent. 
+- Hindsight (Per-project long-term memory backed by a Hindsight REST API)
 
 ## Install
 
