@@ -166,12 +166,13 @@ export default function (pi: ExtensionAPI) {
           "interface-to-implementation, framework re-render) that grep cannot. Naming a file or " +
           "symbol in the query returns its current source, the same shape the read tool gives you.",
         promptSnippet:
-          "codegraph_explore: semantic search over the indexed codebase — symbols' source, " +
-          "call paths and blast radius in one call.",
+          "Semantic codebase search: symbols' source, call paths and blast radius in one call",
         promptGuidelines: [
-          "Prefer codegraph_explore over a grep/read sweep when you need to understand how " +
-            "something works or what a change would affect, and do not re-read files whose " +
-            "source codegraph_explore already returned.",
+          "Start every codebase investigation ('how does X work', 'what would break if I " +
+            "change X') with codegraph_explore, never with grep/rg or reading files; do not " +
+            "re-read files whose source codegraph_explore already returned.",
+          "If codegraph_explore reports a missing or stale index, fall back to grep and read " +
+            "instead of retrying.",
         ],
         parameters: Type.Object({
           query: Type.String({
@@ -211,6 +212,7 @@ export default function (pi: ExtensionAPI) {
           "numbers and its dependents. Container symbols (classes, interfaces, structs, enums, " +
           "modules, namespaces) return a structural outline with a member list by design — for a " +
           "container's code, call codegraph_node on a specific member, or pass `file` for file mode.",
+        promptSnippet: "Read one symbol's source with its callers/callees, or a file with dependents",
         promptGuidelines: [
           "Use codegraph_node to read one symbol's source and its callers instead of reading a " +
             "whole file.",
@@ -261,6 +263,7 @@ export default function (pi: ExtensionAPI) {
         description:
           "Search the index for symbols by name and return their kind and location. " +
           "Use codegraph_explore instead when you want to understand code rather than locate it.",
+        promptSnippet: "Locate symbols by name or fragment in the code index",
         parameters: Type.Object({
           search: Type.String({ minLength: 1, description: "Symbol name or fragment." }),
           limit: Type.Optional(
@@ -293,6 +296,10 @@ export default function (pi: ExtensionAPI) {
             ? "Find every function or method that calls a symbol. Zero callers outside tests is " +
               "strong evidence a symbol is dead code."
             : "Find every function or method that a symbol calls.",
+        promptSnippet:
+          direction === "callers"
+            ? "List every caller of a symbol"
+            : "List every symbol a function or method calls",
         parameters: Type.Object({
           symbol: Type.String({ minLength: 1, description: "Symbol name to trace." }),
           limit: Type.Optional(
@@ -323,6 +330,10 @@ export default function (pi: ExtensionAPI) {
         description:
           "Analyze what code is affected by changing a symbol, traversing dependents to a given " +
           "depth. Use before editing a widely-used symbol.",
+        promptSnippet: "Blast radius of changing a symbol, to a given depth",
+        promptGuidelines: [
+          "Use codegraph_impact before editing a symbol that is used from many places.",
+        ],
         parameters: Type.Object({
           symbol: Type.String({ minLength: 1, description: "Symbol about to change." }),
           depth: Type.Optional(
@@ -348,6 +359,7 @@ export default function (pi: ExtensionAPI) {
         description:
           "Show the project's file structure from the index, with each file's language and " +
           "symbol count.",
+        promptSnippet: "Indexed file tree with language and symbol counts",
         parameters: Type.Object({
           filter: Type.Optional(
             Type.String({ description: "Only files under this directory." }),
@@ -382,6 +394,7 @@ export default function (pi: ExtensionAPI) {
         description:
           "Show the index status and statistics for a project: file, node and edge counts, and " +
           "a breakdown by symbol kind.",
+        promptSnippet: "Code index status and statistics",
         parameters: Type.Object({
           project_path: PROJECT_PATH_PARAM,
         }),

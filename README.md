@@ -47,6 +47,32 @@ entry that re-exports it, e.g.:
 export { default } from "~/Workspace/my-pi-agent-plugins/extensions/hindsight/index.ts";
 ```
 
+## Teaching pi to use these tools
+
+Every tool here ships its own prompt surface, so no extra configuration is needed
+for the model to see it:
+
+- `promptSnippet` → one line in the system prompt's `Available tools` list (what exists).
+- `promptGuidelines` → bullets in `Guidelines` naming the tool (when to use it, when not,
+  and what to prefer instead). Cross-tool preferences are written from the losing side
+  (e.g. web_search says "only when context7 has no match") so they stay correct when the
+  other extension is not installed.
+- `description` / parameter descriptions → the tool schema (how to call it).
+
+`tts` and `stt` are user-invoked (`/speak`, `/dictate`, keybindings) and intentionally
+have no model-facing surface.
+
+Cross-tool ordering that spans extensions belongs in your own `~/.pi/agent/AGENTS.md`,
+which pi loads into every session. A short block that works well:
+
+```markdown
+## Tool Strategy
+- Understanding code or a change's impact: codegraph_explore → lsp → grep/read.
+- Third-party library API/config/migration: context7_resolve_library_id + context7_query_docs → web_search + web_fetch.
+- My preferences, past decisions or earlier sessions: hindsight_recall first, then ask.
+- Store durable preferences/decisions with hindsight_retain when stated.
+```
+
 ## Conventions
 
 - One directory per plugin under `extensions/`, entry point `index.ts` with a

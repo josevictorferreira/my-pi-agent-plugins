@@ -194,10 +194,13 @@ export default function (pi: ExtensionAPI) {
       "workspace, or read the current diagnostics of a file. Positions are " +
       "1-based, matching what read shows.",
     promptSnippet:
-      "lsp: language-server lookups (hover, definition, references, symbols, diagnostics).",
+      "Language-server lookups: hover, definition, references, symbols, diagnostics",
     promptGuidelines: [
-      "Use lsp instead of grep to find where a symbol is defined or used, and to " +
-        "check a type, whenever the file's language has a server available.",
+      "Once you have a symbol's file and line, use lsp (definition, references, " +
+        "hover) instead of grep to follow it or check its type; lsp resolves " +
+        "imports, overloads and re-exports that text search cannot.",
+      "Do not call lsp diagnostics for a file you just edited or wrote: its errors " +
+        "are already appended to the edit/write result.",
     ],
     parameters: Type.Object({
       operation: Type.Union(

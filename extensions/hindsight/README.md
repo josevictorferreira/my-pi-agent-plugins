@@ -98,3 +98,4 @@ End-of-session retrospective, available two ways:
 | `HINDSIGHT_API_URL` | `https://hindsight-api.josevictor.me` | Hindsight API base URL |
 | `HINDSIGHT_API_TOKEN` | unset | Optional bearer token |
 | `HINDSIGHT_USER_BANK` | `pi-agent-user` | User-wide bank id |
+| `HINDSIGHT_AUTO_RECALL` | unset | Set to `1` to inject memories relevant to each prompt as a hidden message before the agent runs (300-token budget per bank), so the model does not have to decide to call `hindsight_recall` |

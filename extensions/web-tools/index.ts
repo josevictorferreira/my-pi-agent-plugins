@@ -78,10 +78,11 @@ export default function (pi: ExtensionAPI) {
     description:
       "Search the web. Use this for current events, facts beyond your training " +
       "data, and to find documentation or URLs to read with web_fetch.",
-    promptSnippet: "web_search: search the web; web_fetch: read the content of a URL.",
+    promptSnippet: "Search the web for current information and URLs",
     promptGuidelines: [
-      "Use web_search for information beyond your training data; use web_fetch to " +
-        "read a specific URL before citing it.",
+      "Use web_search for current events, error messages and anything beyond your " +
+        "training data; for third-party library docs use it only when context7 has " +
+        "no match.",
     ],
     parameters: Type.Object({
       query: Type.String({
@@ -159,6 +160,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Retrieve the readable content of a URL (article text as markdown by " +
       "default). Pair with web_search to read a result.",
+    promptSnippet: "Read a URL's content as markdown",
+    promptGuidelines: ["Use web_fetch to read a URL before citing or summarising it."],
     parameters: Type.Object({
       url: Type.String({
         minLength: 1,

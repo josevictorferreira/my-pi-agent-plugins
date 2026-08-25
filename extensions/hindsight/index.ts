@@ -1,5 +1,6 @@
 import type {
   AgentEndEvent,
+  BeforeAgentStartEvent,
   AgentSettledEvent,
   AgentStartEvent,
   ExtensionAPI,
@@ -17,6 +18,12 @@ import { execFileSync } from "node:child_process";
 
 const DEFAULT_API_URL = "https://hindsight-api.josevictor.me";
 const USER_BANK = process.env.HINDSIGHT_USER_BANK || "pi-agent-user";
+
+// Opt-in auto-recall: inject memories relevant to each prompt so the model
+// need not decide to call hindsight_recall. Budget is per bank (two banks) and
+// paid on every prompt, so keep it small.
+const AUTO_RECALL = process.env.HINDSIGHT_AUTO_RECALL === "1";
+const AUTO_RECALL_MAX_TOKENS = 300;
 
 // Auto-retention filters: skip trivial prompts ("ok", "yes", "continue") and
 // cap item size so ingestion stays cheap on very long final responses.
@@ -130,6 +137,64 @@ async function callApi(
   }
 
   return { data: await response.json() };
+}
+
+type Scope = "user" | "project" | "both";
+
+/**
+ * Recall from the user and/or project bank, merged, deduped by text and sorted
+ * by score. `failures` lists banks that could not be reached; `hardFailure`
+ * is set when none could.
+ */
+async function recall(
+  query: string,
+  scope: Scope,
+  cwd: string,
+  maxTokens: number,
+  signal: AbortSignal | undefined,
+) {
+  const banks: { label: string; bankId: string }[] = [];
+  if (scope !== "user") banks.push({ label: "project", bankId: deriveBankId(cwd) });
+  if (scope !== "project") banks.push({ label: "user", bankId: USER_BANK });
+
+  const responses = await Promise.all(
+    banks.map(async (bank) => ({
+      bank,
+      ...(await callApi(
+        "hindsight_recall",
+        bank.bankId,
+        "/memories/recall",
+        { query, budget: "mid", max_tokens: maxTokens },
+        signal,
+      )),
+    })),
+  );
+
+  const failures = responses.filter((r) => r.error);
+  const seen = new Set<string>();
+  const merged: { label: string; result: RecallResult }[] = [];
+  for (const r of responses) {
+    if (r.error) continue;
+    for (const result of r.data?.results ?? []) {
+      if (seen.has(result.text)) continue;
+      seen.add(result.text);
+      merged.push({ label: r.bank.label, result });
+    }
+  }
+  merged.sort((a, b) => (b.result.scores?.final ?? 0) - (a.result.scores?.final ?? 0));
+
+  return {
+    banks: banks.map((b) => b.bankId),
+    merged,
+    failures,
+    hardFailure: responses.length > 0 && failures.length === responses.length,
+  };
+}
+
+function formatMemory({ label, result }: { label: string; result: RecallResult }): string {
+  const typeStr = result.type ? " [" + result.type + "]" : "";
+  const dateStr = result.mentioned_at ? " (" + result.mentioned_at + ")" : "";
+  return "- [" + label + "] " + result.text + typeStr + dateStr;
 }
 
 function errorResult(text: string, status?: number) {
@@ -261,6 +326,25 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
+  if (AUTO_RECALL) {
+    pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
+      const text = event.prompt.trim();
+      if (!text || text.startsWith("/") || text.length < MIN_PROMPT_CHARS) return undefined;
+      const { merged } = await recall(text, "both", ctx.cwd, AUTO_RECALL_MAX_TOKENS, undefined);
+      if (merged.length === 0) return undefined;
+      return {
+        message: {
+          customType: "hindsight-recall",
+          content:
+            "Long-term memories relevant to this prompt (from hindsight):\n" +
+            merged.map(formatMemory).join("\n"),
+          display: false,
+          details: { resultCount: merged.length },
+        },
+      };
+    });
+  }
+
   pi.on("tool_result", async (event: ToolResultEvent) => {
     if (!event.isError) return;
     const error = event.content
@@ -381,7 +465,7 @@ export default function (pi: ExtensionAPI) {
       "before acting on anything the user might have a standing preference " +
       "about, and whenever a task resembles something that went wrong before.",
     promptSnippet:
-      "hindsight_recall: search long-term memory — user-wide preferences/lessons and this project's history.",
+      "Search long-term memory: user-wide preferences/lessons and this project's history",
     promptGuidelines: [
       "Call hindsight_recall before answering questions about prior sessions, " +
         "user preferences or past decisions — your context window does not carry them.",
@@ -408,62 +492,27 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext) {
-      const projectBankId = deriveBankId(ctx.cwd);
-      const banks: { label: string; bankId: string }[] = [];
-      if (params.scope !== "user") banks.push({ label: "project", bankId: projectBankId });
-      if (params.scope !== "project") banks.push({ label: "user", bankId: USER_BANK });
-
-      const responses = await Promise.all(
-        banks.map(async (bank) => ({
-          bank,
-          ...(await callApi(
-            "hindsight_recall",
-            bank.bankId,
-            "/memories/recall",
-            {
-              query: params.query,
-              budget: "mid",
-              max_tokens: params.max_tokens ?? 4096,
-            },
-            signal,
-          )),
-        })),
+      const { banks, merged, failures, hardFailure } = await recall(
+        params.query,
+        (params.scope ?? "both") as Scope,
+        ctx.cwd,
+        params.max_tokens ?? 4096,
+        signal,
       );
 
-      const failures = responses.filter((r) => r.error);
-      const hardFailure = responses.length > 0 && failures.length === responses.length;
       if (hardFailure) {
-        const first = responses[0] as typeof responses[number] & { error?: string; status?: number };
+        const first = failures[0];
         return errorResult(first.error ?? "hindsight_recall failed", first.status);
       }
-
-      // Merge, dedupe by text, sort by final score.
-      const seen = new Set<string>();
-      const merged: { label: string; result: RecallResult }[] = [];
-      for (const r of responses) {
-        if (r.error) continue;
-        for (const result of r.data?.results ?? []) {
-          if (seen.has(result.text)) continue;
-          seen.add(result.text);
-          merged.push({ label: r.bank.label, result });
-        }
-      }
-      merged.sort(
-        (a, b) => (b.result.scores?.final ?? 0) - (a.result.scores?.final ?? 0),
-      );
 
       if (merged.length === 0) {
         return {
           content: [{ type: "text" as const, text: "No relevant memories found." }],
-          details: { banks: banks.map((b) => b.bankId), resultCount: 0 },
+          details: { banks, resultCount: 0 },
         };
       }
 
-      const lines = merged.map(({ label, result }) => {
-        const typeStr = result.type ? " [" + result.type + "]" : "";
-        const dateStr = result.mentioned_at ? " (" + result.mentioned_at + ")" : "";
-        return "- [" + label + "] " + result.text + typeStr + dateStr;
-      });
+      const lines = merged.map(formatMemory);
 
       const failureNote =
         failures.length > 0
@@ -478,7 +527,7 @@ export default function (pi: ExtensionAPI) {
               "Found " + merged.length + " memories:\n\n" + lines.join("\n") + failureNote,
           },
         ],
-        details: { banks: banks.map((b) => b.bankId), resultCount: merged.length },
+        details: { banks, resultCount: merged.length },
       };
     },
   });
@@ -495,8 +544,7 @@ export default function (pi: ExtensionAPI) {
       "committing'); use scope 'project' for decisions about this codebase. " +
       "Use kind 'lesson' when you realise mid-run that you lacked context you " +
       "should have had.",
-    promptSnippet:
-      "hindsight_retain: store a durable user preference, project decision, or lesson in long-term memory.",
+    promptSnippet: "Store a durable user preference, project decision or lesson",
     promptGuidelines: [
       "Use hindsight_retain (scope 'user') whenever the user states a " +
         "preference or convention that is not specific to this repo; use " +

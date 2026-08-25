@@ -95,8 +95,13 @@ export default function (pi: ExtensionAPI) {
       "Search Context7 for a library or framework and get its Context7 library ID. " +
       "Call this before context7_query_docs unless the ID ('/org/project') is " +
       "already known.",
-    promptSnippet:
-      "context7: resolve a library ID, then query current docs for any library/framework.",
+    promptSnippet: "Find a library's Context7 ID (step 1 before context7_query_docs)",
+    promptGuidelines: [
+      "Before explaining or writing code against any third-party library API, " +
+        "configuration or migration, call context7_resolve_library_id (once per " +
+        "library per session) then context7_query_docs; never answer such questions " +
+        "from memory alone, even when you think you know the syntax.",
+    ],
     parameters: Type.Object({
       library_name: Type.String({
         minLength: 1,
@@ -156,11 +161,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Fetch up-to-date documentation and code examples for a library from " +
       "Context7. Prefer this over guessing API syntax from training data.",
-    promptGuidelines: [
-      "When answering questions about a library's API, configuration or migration, " +
-        "query context7 docs instead of relying on training data — resolve the " +
-        "library ID first.",
-    ],
+    promptSnippet: "Current docs and code examples for a library, by Context7 ID",
     parameters: Type.Object({
       library_id: Type.String({
         minLength: 1,
