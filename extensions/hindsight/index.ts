@@ -1,8 +1,11 @@
 import type {
   AgentEndEvent,
+  AgentSettledEvent,
+  AgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
   InputEvent,
+  SessionShutdownEvent,
   SessionStartEvent,
   ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -27,6 +30,12 @@ const MAX_ERROR_CHARS = 200;
 
 // Lesson extraction: only keep lessons the model is reasonably sure about.
 const MIN_LESSON_CONFIDENCE = 0.6;
+
+// Auto-retrospective: wait for the agent to be idle this long after settling
+// before distilling the session, and only once per session.
+const RETROSPECTIVE_IDLE_MS = 120000;
+const MIN_RETROSPECTIVE_CHARS = 200;
+const MAX_RETROSPECTIVE_ITEMS = 10;
 
 const USER_BANK_RETAIN_MISSION =
   "Extract only durable facts about the user: preferences, conventions, tools " +
@@ -207,6 +216,29 @@ export default function (pi: ExtensionAPI) {
   let lastFinalAnswer: string | null = null;
   let lastRunAborted = false;
 
+  // --- Auto-retrospective --------------------------------------------------
+  //
+  // Collect user prompts and assistant answers across the whole session;
+  // once the agent has been idle for RETROSPECTIVE_IDLE_MS after settling,
+  // distill durable preferences/decisions with a nested complete() call and
+  // retain them. Runs at most once per session and never spawns an agent turn.
+  const sessionTurns: string[] = [];
+  let retrospectiveDone = false;
+  let retrospectiveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function scheduleRetrospective(ctx: ExtensionContext) {
+    if (retrospectiveDone) return;
+    if (retrospectiveTimer) clearTimeout(retrospectiveTimer);
+    retrospectiveTimer = setTimeout(() => {
+      retrospectiveTimer = null;
+      if (retrospectiveDone) return;
+      retrospectiveDone = true;
+      runRetrospective(ctx, sessionTurns).catch(() => {
+        // Fire-and-forget: never a session error.
+      });
+    }, RETROSPECTIVE_IDLE_MS);
+  }
+
   pi.on("input", async (event: InputEvent) => {
     const text = event.text.trim();
     // Extension-injected inputs aren't "my own prompts"; slash commands and
@@ -214,7 +246,7 @@ export default function (pi: ExtensionAPI) {
     if (event.source === "extension") return undefined;
     if (!text || text.startsWith("/") || text.length < MIN_PROMPT_CHARS) return undefined;
     pendingPrompts.push(text.slice(0, MAX_ITEM_CHARS));
-
+    sessionTurns.push("User: " + text.slice(0, MAX_ITEM_CHARS));
     // Friction signal: the user correcting the previous run.
     const lower = text.toLowerCase();
     if (CORRECTION_MARKERS.some((m) => lower === m || lower.startsWith(m + " ") || lower.startsWith(m + ","))) {
@@ -307,6 +339,34 @@ export default function (pi: ExtensionAPI) {
 
     lastUserPrompt = userPrompt;
     lastFinalAnswer = finalText || null;
+    if (finalText) sessionTurns.push("Agent: " + finalText.slice(0, MAX_ITEM_CHARS));
+  });
+
+  // A new run means the user is not done; cancel any pending retrospective.
+  pi.on("agent_start", async (_event: AgentStartEvent) => {
+    if (retrospectiveTimer) {
+      clearTimeout(retrospectiveTimer);
+      retrospectiveTimer = null;
+    }
+  });
+
+  pi.on("agent_settled", async (_event: AgentSettledEvent, ctx: ExtensionContext) => {
+    scheduleRetrospective(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event: SessionShutdownEvent, ctx: ExtensionContext) => {
+    if (retrospectiveTimer) {
+      clearTimeout(retrospectiveTimer);
+      retrospectiveTimer = null;
+    }
+    // Quitting is the clearest end-of-session signal: distill now rather than
+    // losing short sessions to the idle debounce. Best-effort, un-awaited.
+    if (!retrospectiveDone && sessionTurns.join("\n\n").length >= MIN_RETROSPECTIVE_CHARS) {
+      retrospectiveDone = true;
+      runRetrospective(ctx, sessionTurns).catch(() => {
+        // Fire-and-forget: never a session error.
+      });
+    }
   });
 
   // --- Recall tool ----------------------------------------------------------
@@ -426,7 +486,7 @@ export default function (pi: ExtensionAPI) {
   // --- Explicit memory store -------------------------------------------------
 
   pi.registerTool({
-    name: "hindsight_remember",
+    name: "hindsight_retain",
     label: "Store Memory",
     description:
       "Explicitly store a durable fact in long-term memory. Use scope 'user' " +
@@ -436,9 +496,9 @@ export default function (pi: ExtensionAPI) {
       "Use kind 'lesson' when you realise mid-run that you lacked context you " +
       "should have had.",
     promptSnippet:
-      "hindsight_remember: store a durable user preference, project decision, or lesson in long-term memory.",
+      "hindsight_retain: store a durable user preference, project decision, or lesson in long-term memory.",
     promptGuidelines: [
-      "Use hindsight_remember (scope 'user') whenever the user states a " +
+      "Use hindsight_retain (scope 'user') whenever the user states a " +
         "preference or convention that is not specific to this repo; use " +
         "scope 'project' for decisions about this codebase.",
     ],
@@ -467,7 +527,7 @@ export default function (pi: ExtensionAPI) {
       if (params.scope === "user") tags.push("project:" + deriveBankId(ctx.cwd));
 
       const { error, status } = await callApi(
-        "hindsight_remember",
+        "hindsight_retain",
         bankId,
         "/memories",
         { items: [{ content, context: KIND_CONTEXT[params.kind], tags }], async: true },
@@ -492,13 +552,13 @@ export default function (pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify("Reviewing this session for memories to store…", "info");
       pi.sendUserMessage(
         "Run a retrospective over this session and store what matters using the " +
-          "hindsight_remember tool:\n" +
+          "hindsight_retain tool:\n" +
           "1. User preferences or conventions the user stated (scope 'user', " +
           "kind 'preference') — anything not specific to this repo.\n" +
           "2. Project decisions made (scope 'project', kind 'decision').\n" +
           "3. Places you were corrected or went down a wrong path (kind 'lesson', " +
           "scope 'user' if the lesson generalizes, otherwise 'project').\n" +
-          "Store each distinct item with one hindsight_remember call, then finish " +
+          "Store each distinct item with one hindsight_retain call, then finish " +
           "with a short list of what was stored. Store nothing if there is nothing durable to store.",
       );
     },
@@ -598,5 +658,87 @@ async function extractAndStoreLesson(
 
   if (ctx.hasUI) {
     ctx.ui.notify("Lesson stored: " + content.slice(0, 140), "info");
+  }
+}
+
+// --- Auto-retrospective: silent /learn on every session -----------------------
+
+async function runRetrospective(ctx: ExtensionContext, sessionTurns: string[]): Promise<void> {
+  if (!ctx.model) return;
+  const transcript = sessionTurns.join("\n\n").slice(0, MAX_ITEM_CHARS);
+  if (transcript.length < MIN_RETROSPECTIVE_CHARS) return;
+
+  const systemPrompt =
+    "You review an agent session transcript and extract only durable facts " +
+    "worth remembering for future sessions. Collect:\n" +
+    "- user preferences or conventions stated by the user that are not " +
+    "specific to this repo (scope 'user', kind 'preference')\n" +
+    "- project decisions made for this codebase (scope 'project', kind 'decision')\n" +
+    "- places the agent was corrected or went down a wrong path (kind 'lesson', " +
+    "scope 'user' if it generalizes, otherwise 'project')\n" +
+    "Answer with ONLY a JSON array, no prose, of at most " + MAX_RETROSPECTIVE_ITEMS +
+    " objects in exactly this shape:\n" +
+    '{"scope": "user"|"project", "kind": "preference"|"decision"|"lesson", ' +
+    '"content": string, "confidence": number}\n' +
+    "Store only things true across sessions; ignore one-off tasks, " +
+    "implementation details and transient context. Return [] when there is " +
+    "nothing durable.";
+
+  const response = await complete(ctx.model, {
+    systemPrompt,
+    messages: [{ role: "user", content: transcript, timestamp: Date.now() }],
+  });
+
+  const raw = messageText(response);
+  const arrayMatch = raw.match(/\[[\s\S]*\]/);
+  if (!arrayMatch) return;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(arrayMatch[0]);
+  } catch {
+    return;
+  }
+  if (!Array.isArray(parsed)) return;
+
+  const projectBankId = deriveBankId(ctx.cwd);
+  const items: {
+    bankId: string;
+    item: { content: string; context: string; tags: string[] };
+  }[] = [];
+  for (const entry of parsed) {
+    if (typeof entry?.content !== "string" || entry.content.trim().length < 8) continue;
+    if (entry.scope !== "user" && entry.scope !== "project") continue;
+    if (entry.kind !== "preference" && entry.kind !== "decision" && entry.kind !== "lesson") continue;
+    if (typeof entry.confidence !== "number" || entry.confidence < MIN_LESSON_CONFIDENCE) continue;
+
+    const bankId = entry.scope === "user" ? USER_BANK : projectBankId;
+    const tags = ["kind:" + entry.kind];
+    if (entry.scope === "user") tags.push("project:" + projectBankId);
+    items.push({
+      bankId,
+      item: { content: entry.content.trim().slice(0, MAX_ITEM_CHARS), context: KIND_CONTEXT[entry.kind], tags },
+    });
+  }
+  if (items.length === 0) return;
+
+  // One POST per bank, fire-and-forget.
+  await Promise.all(
+    [...new Set(items.map((i) => i.bankId))].map(async (bankId) => {
+      await callApi(
+        "hindsight_retrospective",
+        bankId,
+        "/memories",
+        { items: items.filter((i) => i.bankId === bankId).map((i) => i.item), async: true },
+        undefined,
+      );
+    }),
+  );
+
+  if (ctx.hasUI) {
+    ctx.ui.notify(
+      "Session retrospective: stored " + items.length + " item(s) to long-term memory.",
+      "info",
+    );
   }
 }

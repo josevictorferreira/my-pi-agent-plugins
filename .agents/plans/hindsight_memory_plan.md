@@ -20,7 +20,7 @@ factory.
    dedicated cheap-model env var.
 2. **No double ingestion.** Auto-retention stays project-only (user prompts +
    final response). The user bank is fed only explicitly: the
-   `hindsight_remember` tool and the self-learn lesson extractor.
+   `hindsight_retain` tool and the self-learn lesson extractor.
 3. **No per-turn recall injection** into the system prompt. The agent decides
    when to call `hindsight_recall`; guidelines nudge it. Consequence: a stored
    lesson only helps if the agent recalls — accepted trade-off, see "Later".
@@ -74,8 +74,8 @@ factory.
                          → retain to bank chosen by lesson.scope
                            tags [kind:lesson, project:<id>], context "self-learned lesson"
  hindsight_recall ───► both banks in parallel, merged, lines prefixed [user]/[project]
- hindsight_remember ─► explicit store: scope user|project, kind preference|decision|lesson
- /learn ─────────────► end-of-session retrospective; model writes via hindsight_remember
+ hindsight_retain ─► explicit store: scope user|project, kind preference|decision|lesson
+ /learn ─────────────► end-of-session retrospective; model writes via hindsight_retain
 ```
 
 ### Banks
@@ -111,7 +111,7 @@ factory.
   call before acting on anything the user might have a standing preference
   about; call when a task resembles something that went wrong before.
 
-### `hindsight_remember` (new tool)
+### `hindsight_retain` (new tool)
 
 ```ts
 Type.Object({
@@ -124,7 +124,7 @@ Type.Object({
 
 - Retains one item to the chosen bank, `async: true`, tags/context as above,
   `why` appended to `content` as " — because …" when present.
-- Guidelines: use `hindsight_remember` with `scope: user` whenever the user
+- Guidelines: use `hindsight_retain` with `scope: user` whenever the user
   states a preference or convention that is not specific to this repo
   ("always use bun", "no em dashes", "ask before committing"); `scope:
   project` for decisions about this codebase; `kind: lesson` when you realise
@@ -169,7 +169,7 @@ Everything is fire-and-forget; never surfaces as a session error.
 - `pi.registerCommand("learn", …)`: `pi.sendUserMessage` with a retrospective
   prompt: review this session for (a) user preferences stated, (b) project
   decisions made, (c) places you were corrected or went down a wrong path;
-  store each with `hindsight_remember`; finish with a short list of what was
+  store each with `hindsight_retain`; finish with a short list of what was
   stored.
 - Optional skill `skills/hindsight-memory/SKILL.md` carrying the same
   instructions so the model can run it unprompted at the end of long sessions.
@@ -178,8 +178,8 @@ Everything is fire-and-forget; never surfaces as a session error.
 ## Phases
 
 1. **Two banks** — `USER_BANK`, bank-config patch on `session_start`, merged
-   `hindsight_recall` with `scope`, `hindsight_remember`, README update.
-   → verify: in repo A, `hindsight_remember(scope:user, …)`; in repo B,
+   `hindsight_recall` with `scope`, `hindsight_retain`, README update.
+   → verify: in repo A, `hindsight_retain(scope:user, …)`; in repo B,
    `hindsight_recall` returns it prefixed `[user]`; `bun run check` clean.
 2. **Self-learn autopilot** — friction flags, lesson extraction, retain.
    → verify: deliberately correct the agent ("no, use bun"), then

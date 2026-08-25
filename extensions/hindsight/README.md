@@ -11,7 +11,7 @@ so the HTTP contract is reimplemented here).
   basename; linked worktrees share their repo's bank; cwd basename outside
   git). Fed by auto-retention only.
 - **User bank** (`HINDSIGHT_USER_BANK`, default `pi-agent-user`) — one shared
-  across every project. Fed only explicitly: the `hindsight_remember` tool
+  across every project. Fed only explicitly: the `hindsight_retain` tool
   and the self-learn lesson extractor. On `session_start` (once per process)
   the extension PATCHes the user bank config with a `retain_mission` steering
   the extractor toward durable user facts (preferences, conventions, lessons)
@@ -43,7 +43,7 @@ POST per run; ingestion failures never surface as session errors.
   both banks in parallel by default (`scope: both|project|user`), merges and
   dedupes results sorted by final score, each line prefixed `[user]` or
   `[project]`. If one bank fails the other is still returned with a note.
-- `hindsight_remember` — explicitly store one durable fact
+- `hindsight_retain` — explicitly store one durable fact
   (`scope: user|project`, `kind: preference|decision|lesson`, optional `why`).
   Use `scope: user` for preferences/conventions that are not repo-specific,
   `scope: project` for decisions about this codebase.
@@ -75,11 +75,21 @@ notification shows what was stored so it can be undone in Hindsight if wrong.
 Everything is fire-and-forget; self-learning never surfaces as a session
 error.
 
-## `/learn` command
+## `/learn` command and auto-retrospective
 
-End-of-session retrospective: sends a prompt asking the model to review the
-session for stated preferences, project decisions and corrections, store each
-with `hindsight_remember`, and list what was stored.
+End-of-session retrospective, available two ways:
+
+- `/learn` — sends a prompt asking the model to review the session for stated
+  preferences, project decisions and corrections, store each with
+  `hindsight_retain`, and list what was stored.
+- **Automatic** — after the agent has been idle for 2 minutes past
+  `agent_settled` (or at `session_shutdown` for sessions quit sooner), the
+  extension silently runs the same retrospective as a nested `complete()`
+  call over the collected prompts/answers: at most 10 items with
+  `confidence >= 0.6`, one fire-and-forget POST per bank, once per session.
+  A UI notification reports what was stored. Never spawns an agent turn and
+  never surfaces as a session error; sessions quit immediately are
+  best-effort (the process may exit before the LLM call finishes).
 
 ## Configuration
 
