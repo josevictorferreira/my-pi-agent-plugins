@@ -5,7 +5,7 @@
 **Branch:** main
 
 ## OVERVIEW
-Single Bun/TypeScript pi package containing five independently loaded extensions. Pi loads `extensions/*/index.ts` through jiti; there is no build step and the repository has one root package boundary.
+Single Bun/TypeScript pi package containing six independently loaded extensions. Pi loads `extensions/*/index.ts` through jiti; there is no build step and the repository has one root package boundary.
 
 ## STRUCTURE
 ```text
@@ -15,6 +15,7 @@ Single Bun/TypeScript pi package containing five independently loaded extensions
 │   ├── context7/             # Context7 documentation API client
 │   ├── hindsight/            # Hindsight memory API and automatic retention
 │   ├── lsp/                  # language-server client, configuration, and pi hooks
+│   ├── stt/                  # microphone dictation into the prompt via Velox
 │   ├── tts/                  # spoken summary of the last reply via Velox
 │   └── web-tools/            # Velox web search and URL extraction
 ├── .agents/plans/            # tracked design plans
@@ -34,6 +35,7 @@ Single Bun/TypeScript pi package containing five independently loaded extensions
 | Change package/typechecking setup | `package.json`, `tsconfig.json` | Only script is `bun run check`; compiler includes `extensions`. |
 | Understand installation/loading | `README.md`, `package.json` | `pi.extensions` points at `./extensions`; plugins ship without local dependencies. |
 | Understand or change the spoken-summary flow | `extensions/tts/index.ts` | `/speak` command and `ctrl+alt+s` shortcut; Velox chat summary + audio speech, local playback. |
+| Understand or change the dictation flow | `extensions/stt/index.ts` | `/dictate` command and `ctrl+alt+d` shortcut; local recording via `pw-record`/`ffmpeg`, Velox transcription, transcript appended to the prompt editor. |
 
 ## CODE MAP
 The package has 7 TypeScript source files and no tests. LSP analysis reports no diagnostics. Reference counts below are structural indicators from the source layout rather than a generated call graph.
