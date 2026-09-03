@@ -11,6 +11,7 @@ Custom extensions for the [pi coding agent](https://github.com/badlogic/pi-mono)
 | [context7](extensions/context7/) | Up-to-date library documentation from [Context7](https://context7.com): `context7_resolve_library_id` to find a library, `context7_query_docs` to fetch current docs and code examples |
 | [web-tools](extensions/web-tools/) | Web search and URL content extraction via the [Velox](https://velox.josevictor.me/docs) proxy: `web_search` and `web_fetch` tools |
 | [lsp](extensions/lsp/) | Language server integration: compiler errors appended to `edit`/`write` results, plus an `lsp` tool for hover, definitions, references, symbols and diagnostics |
+| [skill-state](extensions/skill-state/) | `/state-run <objective>`: executes a long-horizon SE task with the SKILL.state runtime (arXiv:2608.26263): frozen spec + bounded JSON state + latest observation only, so per-step prompt size is constant and cumulative tokens are linear in steps. `/state-cancel` aborts |
 
 
 ## New Plugins
