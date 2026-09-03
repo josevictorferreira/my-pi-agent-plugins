@@ -8,6 +8,10 @@ import { createInitialState, merge, recordChanged, recordCheck, recordInspected,
 
 const MAX_RETRIES = 2;
 export const DEFAULT_MAX_STEPS = 40;
+// Transient provider failures (proxy 5xx/404, network resets) are retried a
+// few times with backoff before the run is checkpointed and stopped.
+const PROVIDER_ATTEMPTS = 3;
+const PROVIDER_BACKOFF_MS = [1000, 4000];
 
 export interface ModelReply {
   text: string;
@@ -29,11 +33,26 @@ export interface StepTelemetry {
   output: number;
   cacheRead: number;
   retries: number;
+  /** Why each rejected attempt was rejected (validation / merge errors). */
+  rejections: string[];
+  providerRetries: number;
   reReadCount: number;
   durationMs: number;
 }
 
 export type RunStatus = "completed" | "failed" | "cancelled";
+
+/** Everything needed to continue a run from Σt with any model (paper Table 3). */
+export interface Checkpoint {
+  runId: string;
+  objective: string;
+  spec: string;
+  maxSteps: number;
+  state: SkillExecutionState;
+  observation: string;
+  totals: { input: number; output: number; cacheRead: number };
+  reReadCount: number;
+}
 
 export interface RunSummary {
   runId: string;
@@ -54,6 +73,8 @@ export interface RunSummary {
   changedFiles: string[];
   checks: SkillExecutionState["checks"];
   blockers: string[];
+  /** Present when status is not "completed": resume with `/state-resume`. */
+  checkpoint?: Checkpoint;
 }
 
 export interface RunOptions {
@@ -65,6 +86,8 @@ export interface RunOptions {
   signal: AbortSignal;
   complete: CompleteFn;
   onStep: (telemetry: StepTelemetry, state: SkillExecutionState) => void;
+  /** Continue from a checkpoint instead of Σ0 / workspace snapshot. */
+  resume?: Checkpoint;
 }
 
 async function initialObservation(cwd: string, signal: AbortSignal): Promise<string> {
@@ -76,44 +99,72 @@ async function initialObservation(cwd: string, signal: AbortSignal): Promise<str
   return "Workspace: " + cwd + "\n" + result.observation.replace(/^Result of exec_shell:\n\$ [^\n]*\n[^\n]*\n/, "");
 }
 
+async function completeWithRetry(
+  complete: CompleteFn,
+  prompt: string,
+  signal: AbortSignal,
+): Promise<{ reply: ModelReply; attempts: number }> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= PROVIDER_ATTEMPTS; attempt++) {
+    try {
+      return { reply: await complete(prompt, signal), attempts: attempt };
+    } catch (err) {
+      lastError = err;
+      if (signal.aborted || attempt === PROVIDER_ATTEMPTS) break;
+      await new Promise((r) => setTimeout(r, PROVIDER_BACKOFF_MS[attempt - 1]));
+    }
+  }
+  throw lastError;
+}
+
 export async function run(options: RunOptions): Promise<RunSummary> {
-  const { runId, objective, spec, cwd, signal, complete } = options;
+  const { runId, objective, spec, cwd, signal, complete, resume } = options;
   const specBytes = Buffer.byteLength(spec);
-  let state = createInitialState(objective);
-  let observation = await initialObservation(cwd, signal);
-  const totals = { input: 0, output: 0, cacheRead: 0 };
+  let state = resume ? structuredClone(resume.state) : createInitialState(objective);
+  let observation = resume ? resume.observation : await initialObservation(cwd, signal);
+  const totals = resume ? { ...resume.totals } : { input: 0, output: 0, cacheRead: 0 };
   let promptTokenSum = 0;
   let maxPromptTokens = 0;
   let minPromptBytes = Infinity;
   let maxPromptBytes = 0;
-  let reReadCount = 0;
-  let steps = 0;
+  let reReadCount = resume?.reReadCount ?? 0;
+  let steps = state.step;
+  const firstStep = steps;
   // Identical read/search actions return identical results until a file
   // changes; tell the model so instead of letting it loop (paper §7, cond. 2).
   const seenReads = new Map<string, number>();
 
-  const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => ({
-    runId,
-    objective,
-    status,
-    steps,
-    totals,
-    avgPromptTokens: steps ? Math.round(promptTokenSum / steps) : 0,
-    maxPromptTokens,
-    minPromptBytes: steps ? minPromptBytes : 0,
-    maxPromptBytes,
-    reReadCount,
-    changedFiles: [...state.changedFiles],
-    checks: [...state.checks],
-    blockers: [...state.blockers],
-    ...extra,
-  });
+  const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => {
+    const own = steps - firstStep;
+    return {
+      runId,
+      objective,
+      status,
+      steps,
+      totals,
+      avgPromptTokens: own ? Math.round(promptTokenSum / own) : 0,
+      maxPromptTokens,
+      minPromptBytes: own ? minPromptBytes : 0,
+      maxPromptBytes,
+      reReadCount,
+      changedFiles: [...state.changedFiles],
+      checks: [...state.checks],
+      blockers: [...state.blockers],
+      checkpoint:
+        status === "completed"
+          ? undefined
+          : { runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount },
+      ...extra,
+    };
+  };
 
   while (steps < options.maxSteps) {
     if (signal.aborted) return finish("cancelled");
     const step = steps + 1;
     const started = Date.now();
     let retries = 0;
+    let providerRetries = 0;
+    const rejections: string[] = [];
     let errors: string[] | undefined;
     let accepted: { response: StepResponse; next: SkillExecutionState } | undefined;
     let promptBytes = 0;
@@ -130,10 +181,16 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 
       let reply: ModelReply;
       try {
-        reply = await complete(prompt, signal);
+        const attempt = await completeWithRetry(complete, prompt, signal);
+        reply = attempt.reply;
+        providerRetries += attempt.attempts - 1;
       } catch (err) {
         if (signal.aborted) return finish("cancelled");
-        return finish("failed", { error: "model call failed at step " + step + ": " + String((err as Error).message ?? err) });
+        return finish("failed", {
+          error:
+            "model call failed at step " + step + " after " + PROVIDER_ATTEMPTS + " attempts: " +
+            String((err as Error).message ?? err),
+        });
       }
       if (signal.aborted) return finish("cancelled");
       usage.input += reply.usage?.input ?? 0;
@@ -150,6 +207,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       }
       if (!accepted) {
         retries++;
+        rejections.push((errors ?? []).join("; ").slice(0, 300));
         if (retries > MAX_RETRIES) {
           return finish("failed", {
             error: "step " + step + ": reply rejected " + retries + " times: " + (errors ?? []).join("; "),
@@ -202,6 +260,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
         observationBytes,
         ...usage,
         retries,
+        rejections,
+        providerRetries,
         reReadCount,
         durationMs: Date.now() - started,
       },

@@ -22,6 +22,7 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 
 ```
 /state-run [--skill <path>] [--max-steps N] <objective>
+/state-resume [--max-steps N]
 /state-cancel
 ```
 
@@ -32,6 +33,9 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 - An identical `read_file` or `search_files` repeated with no intervening write is still executed, but its observation is prefixed with a note saying it already ran at step *k* and nothing changed. Writes clear that memory.
 - The run uses the session's current model with no provider thinking (reasoning is textual, as in the paper's Appendix A.4). No sampling temperature is sent by default because some upstreams reject the parameter; set `SKILL_STATE_TEMPERATURE=0` to reproduce the paper's decoding on a model that accepts it.
 - `/state-cancel` or session shutdown aborts the run and kills any running child process.
+- **Recovery.** Σ is the run's entire memory, so a run that fails or is cancelled is checkpointed (spec, state, last observation, token totals) as a `skill-state-checkpoint` session entry. `/state-resume` continues from that state with whatever model is currently selected: switch with `/model` first if the previous one is misbehaving. Pass a larger `--max-steps` when the run stopped on the step cap. This is the paper's "zero-step state recovery" (Table 3) used operationally. The checkpoint is always available in the same Pi process; it survives a restart once the session has at least one assistant message, because Pi only writes the session file from that point on.
+- **Provider errors.** A failed model call is retried up to 3 times with 1 s / 4 s backoff. If it still fails, the run stops and is checkpointed rather than losing its state.
+- Each `skill-state-step` entry records why rejected replies were rejected (`rejections`) and how many provider retries happened, so a run with many retries can be diagnosed from the transcript (expand the entry).
 
 ## Action vocabulary
 

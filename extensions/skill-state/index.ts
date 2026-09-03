@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { complete } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
-import { DEFAULT_MAX_STEPS, run, type CompleteFn, type RunSummary, type StepTelemetry } from "./runner";
+import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepTelemetry } from "./runner";
 import { loadSpec } from "./workflow";
 
 const MAX_RESULT_CHARS = 1024;
@@ -79,6 +79,7 @@ function resultMessage(summary: RunSummary): string {
   if (summary.outcome) lines.push("Outcome: " + summary.outcome);
   if (summary.summary) lines.push("Summary: " + summary.summary);
   if (summary.error) lines.push("Error: " + summary.error);
+  if (summary.checkpoint) lines.push("Checkpointed at step " + summary.steps + "; continue with /state-resume.");
   if (summary.changedFiles.length) lines.push("Changed files: " + summary.changedFiles.join(", "));
   if (summary.blockers.length) lines.push("Blockers: " + summary.blockers.join("; "));
   if (summary.checks.length) {
@@ -105,8 +106,12 @@ export default function (pi: ExtensionAPI) {
       theme.fg("dim", "state-run ") +
       "step " + t.step + " " + theme.bold(t.status) + " → " + t.actionType +
       theme.fg("dim", "  prompt " + t.promptBytes + " B, in " + t.input + " / out " + t.output);
-    if (t.retries) line += theme.fg("warning", "  retries " + t.retries);
-    if (expanded) line += "\n" + theme.fg("dim", JSON.stringify(t, null, 2));
+    if (t.retries) line += theme.fg("warning", "  rejected " + t.retries + "x");
+    if (t.providerRetries) line += theme.fg("warning", "  provider retries " + t.providerRetries);
+    if (expanded) {
+      for (const r of t.rejections) line += "\n" + theme.fg("warning", "  rejected: " + r);
+      line += "\n" + theme.fg("dim", JSON.stringify(t, null, 2));
+    }
     return new Text(line);
   });
 
@@ -130,6 +135,77 @@ export default function (pi: ExtensionAPI) {
     return new Text(text);
   });
 
+  // Last non-completed run, resumable with /state-resume. Also persisted as a
+  // "skill-state-checkpoint" entry so it survives a Pi restart.
+  let lastCheckpoint: Checkpoint | undefined;
+
+  function findCheckpoint(ctx: ExtensionCommandContext): Checkpoint | undefined {
+    if (lastCheckpoint) return lastCheckpoint;
+    const entries = ctx.sessionManager.getBranch();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (entry.type === "custom" && entry.customType === "skill-state-checkpoint") return entry.data as Checkpoint;
+    }
+    return undefined;
+  }
+
+  async function launch(ctx: ExtensionCommandContext, options: Omit<RunOptions, "cwd" | "signal" | "complete" | "onStep">) {
+    let complete: CompleteFn;
+    try {
+      complete = await makeComplete(ctx);
+    } catch (err) {
+      ctx.ui.notify(String((err as Error).message ?? err), "error");
+      return;
+    }
+    const controller = new AbortController();
+    active = { runId: options.runId, controller };
+    ctx.ui.setStatus("state-run", "step " + (options.resume?.state.step ?? 0) + " starting");
+
+    let summary: RunSummary;
+    try {
+      summary = await run({
+        ...options,
+        cwd: ctx.cwd,
+        signal: controller.signal,
+        complete,
+        onStep: (telemetry) => {
+          pi.appendEntry("skill-state-step", telemetry);
+          ctx.ui.setStatus("state-run", "step " + telemetry.step + " " + telemetry.status + " " + telemetry.actionType);
+        },
+      });
+    } finally {
+      active = undefined;
+      ctx.ui.setStatus("state-run", undefined);
+    }
+
+    lastCheckpoint = summary.checkpoint;
+    if (summary.checkpoint) pi.appendEntry("skill-state-checkpoint", summary.checkpoint);
+    pi.appendEntry("skill-state-run", { ...summary, checkpoint: undefined });
+    pi.sendMessage(
+      { customType: "skill-state-result", content: resultMessage(summary), display: true },
+      { triggerTurn: false, deliverAs: "nextTurn" },
+    );
+    const tokens = summary.totals.input + summary.totals.output;
+    if (summary.status === "completed") {
+      ctx.ui.notify("state-run completed: " + summary.steps + " steps, " + tokens + " tokens", "info");
+    } else {
+      ctx.ui.notify(
+        "state-run " + summary.status + " at step " + summary.steps + " (" + tokens + " tokens). " +
+          "State is checkpointed: switch model if needed, then /state-resume [--max-steps N]",
+        "warning",
+      );
+    }
+  }
+
+  pi.registerEntryRenderer<Checkpoint>("skill-state-checkpoint", (entry, _options, theme) => {
+    const c = entry.data;
+    if (!c) return undefined;
+    return new Text(
+      theme.fg("dim", "state-run checkpoint ") + "step " + c.state.step + " " + theme.bold(c.state.status) +
+        theme.fg("dim", "  resume with /state-resume"),
+    );
+  });
+
   pi.registerCommand("state-run", {
     description: "Run an objective with the SKILL.state runtime: /state-run [--skill <path>] [--max-steps N] <objective>",
     handler: async (args, ctx) => {
@@ -139,52 +215,51 @@ export default function (pi: ExtensionAPI) {
       }
       let parsed: ParsedArgs;
       let spec: string;
-      let complete: CompleteFn;
       try {
         parsed = parseArgs(args);
         if (!parsed.objective) throw new Error("usage: /state-run [--skill <path>] [--max-steps N] <objective>");
         spec = await loadSpec(parsed.skill, ctx.cwd);
-        complete = await makeComplete(ctx);
       } catch (err) {
         ctx.ui.notify(String((err as Error).message ?? err), "error");
         return;
       }
+      await launch(ctx, {
+        runId: "sr-" + Date.now().toString(36),
+        objective: parsed.objective,
+        spec,
+        maxSteps: parsed.maxSteps,
+      });
+    },
+  });
 
-      const runId = "sr-" + Date.now().toString(36);
-      const controller = new AbortController();
-      active = { runId, controller };
-      ctx.ui.setStatus("state-run", "step 0 starting");
-
-      let summary: RunSummary;
-      try {
-        summary = await run({
-          runId,
-          objective: parsed.objective,
-          spec,
-          cwd: ctx.cwd,
-          maxSteps: parsed.maxSteps,
-          signal: controller.signal,
-          complete,
-          onStep: (telemetry) => {
-            pi.appendEntry("skill-state-step", telemetry);
-            ctx.ui.setStatus("state-run", "step " + telemetry.step + " " + telemetry.status + " " + telemetry.actionType);
-          },
-        });
-      } finally {
-        active = undefined;
-        ctx.ui.setStatus("state-run", undefined);
+  pi.registerCommand("state-resume", {
+    description: "Continue the last failed or cancelled /state-run from its checkpointed state, with the current model: /state-resume [--max-steps N]",
+    handler: async (args, ctx) => {
+      if (active) {
+        ctx.ui.notify("A state-run is already active; use /state-cancel first", "warning");
+        return;
       }
-
-      pi.appendEntry("skill-state-run", summary);
-      pi.sendMessage(
-        { customType: "skill-state-result", content: resultMessage(summary), display: true },
-        { triggerTurn: false, deliverAs: "nextTurn" },
-      );
-      ctx.ui.notify(
-        "state-run " + summary.status + ": " + summary.steps + " steps, " +
-          (summary.totals.input + summary.totals.output) + " tokens",
-        summary.status === "completed" ? "info" : "warning",
-      );
+      const checkpoint = findCheckpoint(ctx);
+      if (!checkpoint) {
+        ctx.ui.notify("No checkpointed state-run in this session", "info");
+        return;
+      }
+      const flag = /--max-steps\s+(\d+)/.exec(args);
+      const maxSteps = flag ? Number(flag[1]) : checkpoint.maxSteps;
+      if (checkpoint.state.step >= maxSteps) {
+        ctx.ui.notify(
+          "Checkpoint is at step " + checkpoint.state.step + "; pass --max-steps larger than that to continue",
+          "error",
+        );
+        return;
+      }
+      await launch(ctx, {
+        runId: checkpoint.runId,
+        objective: checkpoint.objective,
+        spec: checkpoint.spec,
+        maxSteps,
+        resume: checkpoint,
+      });
     },
   });
 
