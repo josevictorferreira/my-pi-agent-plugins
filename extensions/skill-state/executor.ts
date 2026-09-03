@@ -1,6 +1,6 @@
 import { truncateHead, truncateTail } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { RepoAction } from "./schemas";
 
@@ -164,9 +164,45 @@ function formatSearch(lines: string[], pattern: string, glob: string | undefined
   return { text, shown: [] };
 }
 
+/**
+ * For a path that does not exist, describe the nearest existing ancestor and
+ * its entries so the model can correct the path instead of guessing again.
+ */
+async function describeMissing(cwd: string, absolute: string, rel: string): Promise<string> {
+  let dir = dirname(absolute);
+  while (dir.startsWith(cwd)) {
+    try {
+      if ((await stat(dir)).isDirectory()) break;
+    } catch {
+      // keep walking up
+    }
+    dir = dirname(dir);
+  }
+  const entries = (await readdir(dir, { withFileTypes: true }))
+    .filter((e) => !e.name.startsWith("."))
+    .map((e) => e.name + (e.isDirectory() ? "/" : ""))
+    .sort()
+    .slice(0, 60);
+  const shown = relative(cwd, dir) || ".";
+  return "No such file: " + rel + ". Nearest existing directory " + shown + " contains: " + entries.join(", ");
+}
+
+async function readText(cwd: string, absolute: string, rel: string): Promise<string> {
+  try {
+    return await readFile(absolute, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") throw new Error(await describeMissing(cwd, absolute, rel));
+    if ((err as NodeJS.ErrnoException).code === "EISDIR") {
+      const entries = (await readdir(absolute)).sort().slice(0, 60);
+      throw new Error(rel + " is a directory containing: " + entries.join(", "));
+    }
+    throw err;
+  }
+}
+
 async function readFileWindow(cwd: string, path: string, offset: number | undefined, limit: number | undefined): Promise<string> {
   const { absolute, rel } = safePath(cwd, path);
-  const text = await readFile(absolute, "utf8");
+  const text = await readText(cwd, absolute, rel);
   const lines = text.split("\n");
   const start = Math.max(1, offset ?? 1);
   const count = limit ?? MAX_OBS_LINES;
@@ -186,7 +222,7 @@ async function readFileWindow(cwd: string, path: string, offset: number | undefi
 
 async function patchFile(cwd: string, path: string, oldText: string, newText: string): Promise<string> {
   const { absolute, rel } = safePath(cwd, path);
-  const text = await readFile(absolute, "utf8");
+  const text = await readText(cwd, absolute, rel);
   const first = text.indexOf(oldText);
   if (first === -1) throw new Error("oldText not found in " + rel + "; read the file and copy the exact text");
   if (text.indexOf(oldText, first + oldText.length) !== -1) {

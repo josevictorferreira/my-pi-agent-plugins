@@ -8,16 +8,14 @@ import { Value } from "typebox/value";
 export const STATUSES = ["inspecting", "planning", "editing", "testing", "repairing"] as const;
 export type Status = (typeof STATUSES)[number];
 
-const HypothesisValue = Type.Union([
-  Type.Literal("open"),
-  Type.Literal("confirmed"),
-  Type.Literal("rejected"),
-]);
-
 export interface SkillExecutionState {
   // runtime-owned
   version: 1;
   step: number;
+  /** Step at which `status` last changed (phase budgets are measured from here). */
+  statusSince: number;
+  /** Read-only actions taken since the last write_file/patch_file. */
+  readsSinceWrite: number;
   objective: string;
   inspectedFiles: string[];
   changedFiles: string[];
@@ -25,7 +23,8 @@ export interface SkillExecutionState {
   // model-owned
   status: Status;
   plan: string[];
-  hypotheses: Record<string, "open" | "confirmed" | "rejected">;
+  /** Free text: the hypothesis and its current standing, e.g. "open: ..." */
+  hypotheses: Record<string, string>;
   facts: Record<string, string>;
   blockers: string[];
 }
@@ -34,7 +33,7 @@ export const StatePatchSchema = Type.Object(
   {
     status: Type.Optional(Type.Union(STATUSES.map((s) => Type.Literal(s)))),
     plan: Type.Optional(Type.Array(Type.String())),
-    hypotheses: Type.Optional(Type.Record(Type.String(), Type.Union([HypothesisValue, Type.Null()]))),
+    hypotheses: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
     facts: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
     blockers: Type.Optional(Type.Array(Type.String())),
   },

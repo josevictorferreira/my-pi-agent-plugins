@@ -40,7 +40,7 @@ Single Bun/TypeScript pi package containing eight independently loaded extension
 | Understand or change the dictation flow | `extensions/stt/index.ts` | `/dictate` command and `ctrl+alt+d` shortcut; local recording via `pw-record`/`ffmpeg`, Velox transcription, transcript appended to the prompt editor. |
 | Understand the SKILL.state design and its limits | `.agents/specs/0001-skill-state-plan.md`, `extensions/skill-state/README.md` | Paper claims vs. what is reproduced; verification gates; honesty notes. |
 | Change the state-run loop, retry, or telemetry | `extensions/skill-state/runner.ts` | Algorithm 1: render → complete → parse/validate → merge → execute; rollback-retry ≤ 2; per-step telemetry. |
-| Change the state schema or merge bounds | `extensions/skill-state/schemas.ts`, `extensions/skill-state/state.ts` | TypeBox schemas with `additionalProperties: false`; `⊕` merge with null-delete, list replacement, 6 KB cap. |
+| Change the state schema, merge bounds or phase policy | `extensions/skill-state/schemas.ts`, `extensions/skill-state/state.ts` | TypeBox schemas with `additionalProperties: false`; `⊕` merge with null-delete, list replacement, 6 KB cap; `phaseErrors` and `actionErrors` enforce the inspect budget, the 2-step planning limit, read-only streaks in editing, and changed-files-before-testing as rejection errors. |
 | Change the action vocabulary or observation caps | `extensions/skill-state/executor.ts`, `extensions/skill-state/prompt.ts` | Repo-local actions, 200 lines / 8 KB observations; prompt text mirrors paper Appendix A.4. |
 | Change the built-in SE skill or `--skill` loading | `extensions/skill-state/workflow.ts` | Spec ≤ 4 KB, used verbatim as `{spec}`. |
 

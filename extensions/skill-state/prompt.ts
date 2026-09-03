@@ -16,11 +16,12 @@ const ACTION_VOCABULARY =
 const STATE_RULES =
   "State update rules:\n" +
   '- "state_patch" is merged into the state. Only include keys you change.\n' +
-  "- Object fields (facts, hypotheses): keys merge; set a key to null to delete it.\n" +
+  "- Object fields (facts, hypotheses): keys merge; set a key to null to delete it. Values are short free text.\n" +
   "- List fields (plan, blockers): the list you send replaces the old list entirely.\n" +
-  "- Never send: version, step, objective, inspectedFiles, changedFiles, checks. They are runtime-owned.\n" +
+  "- Never send: version, step, statusSince, readsSinceWrite, objective, inspectedFiles, changedFiles, checks. They are runtime-owned.\n" +
   "- Before leaving a file, write what you learned into facts. You will not see this observation again.\n" +
-  "- Limits: facts ≤ 24 keys (values ≤ 300 chars), hypotheses ≤ 12 keys, plan and blockers ≤ 15 items, whole state ≤ 6 KB.";
+  "- Limits: facts ≤ 24 keys (values ≤ 300 chars), hypotheses ≤ 12 keys (values ≤ 200 chars), plan and blockers ≤ 15 items, whole state ≤ 6 KB.\n" +
+  "- Phases are enforced: after a third of the step budget, status must leave \"inspecting\"; \"planning\" lasts at most 2 steps and requires a non-empty plan, then status must be \"editing\"; in \"editing\", after 3 read-only actions without a write the next action must be write_file, patch_file or finish; \"testing\" requires a changed file. A reply that violates this is rejected and you are asked again.";
 
 const RESPONSE_FORMAT =
   "Provide your response with:\n" +

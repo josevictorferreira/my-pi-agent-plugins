@@ -22,19 +22,26 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 
 ```
 /state-run [--skill <path>] [--max-steps N] <objective>
-/state-resume [--max-steps N]
+/state-resume [--max-steps N] [note for the model]
 /state-cancel
 ```
 
 - `--skill <path>`: markdown file (≤ 4 KB) used verbatim as the spec `P`. Default is the built-in inspect → plan → edit → test → repair workflow in `workflow.ts`.
 - `--max-steps N`: step cap, default 40.
 - One run at a time; a second `/state-run` while one is active is refused.
-- Every prompt tells the model the current step and the cap, so it can budget inspection against editing and testing. The built-in spec asks for at most a third of the budget on inspection and for an early `cannot_complete` when the objective needs information no action can obtain (URLs, production data, decisions only the user can make).
+- Every prompt tells the model the current step and the cap. **Phases and progress are enforced by the runtime, not just requested by the spec.** Rejected replies get the rollback-retry treatment, so the loop forces the transition the same way it forces schema compliance (prose rules alone were not followed by the models tested; validation errors were, on the first retry, every time):
+  - after a third of the budget, a patch that leaves `status` at `inspecting` is rejected;
+  - `planning` requires a non-empty `plan` and lasts at most 2 steps, then `status` must be `editing`;
+  - in `editing`, after 3 read-only actions (`read_file`, `search_files`, `exec_shell`, `git_diff`) without a write, the next action must be `write_file`, `patch_file` or `finish`;
+  - `testing` requires at least one changed file.
+  The runtime tracks this in two runtime-owned state fields, `statusSince` and `readsSinceWrite`, which the model sees but cannot patch.
+- **Budget guidance.** Per-step cost is flat, so the budget is the main knob. Single-file fixes finish in 5 to 15 steps. A multi-file feature in a real application needs 60 to 100; the enforced phases mean roughly a third is inspection, two steps are planning, and the rest is edit and test cycles.
+- The built-in spec asks for `cannot_complete` only when the objective needs information no action can obtain (URLs, production data, decisions only the user can make). Something the objective asks to add and that does not exist yet is the work, not a blocker.
 - An identical `read_file` or `search_files` repeated with no intervening write is still executed, but its observation is prefixed with a note saying it already ran at step *k* and nothing changed. Writes clear that memory.
 - The run uses the session's current model with no provider thinking (reasoning is textual, as in the paper's Appendix A.4). No sampling temperature is sent by default because some upstreams reject the parameter; set `SKILL_STATE_TEMPERATURE=0` to reproduce the paper's decoding on a model that accepts it.
 - `/state-cancel` or session shutdown aborts the run and kills any running child process.
-- **Recovery.** Σ is the run's entire memory, so a run that fails or is cancelled is checkpointed (spec, state, last observation, token totals) as a `skill-state-checkpoint` session entry. `/state-resume` continues from that state with whatever model is currently selected: switch with `/model` first if the previous one is misbehaving. Pass a larger `--max-steps` when the run stopped on the step cap. This is the paper's "zero-step state recovery" (Table 3) used operationally. The checkpoint is always available in the same Pi process; it survives a restart once the session has at least one assistant message, because Pi only writes the session file from that point on.
-- **Provider errors.** A failed model call is retried up to 3 times with 1 s / 4 s backoff. If it still fails, the run stops and is checkpointed rather than losing its state.
+- **Recovery.** Σ is the run's entire memory, so a run that fails or is cancelled is checkpointed (spec, state, last observation, token totals) as a `skill-state-checkpoint` session entry. `/state-resume` continues from that state with whatever model is currently selected: switch with `/model` first if the previous one is misbehaving. Pass a larger `--max-steps` when the run stopped on the step cap. Any other text after the command is delivered to the model as an operator note in the first observation of the resumed run, which is how you answer a `cannot_complete` blocker (for example: `/state-resume --max-steps 60 fail_fast does not exist yet; add it to the workflow config and proceed to planning`). Resuming after `cannot_complete` with no note and no new budget reproduces the same conclusion. This is the paper's "zero-step state recovery" (Table 3) used operationally. The checkpoint is always available in the same Pi process; it survives a restart once the session has at least one assistant message, because Pi only writes the session file from that point on.
+- **Provider errors.** A failed model call is retried up to 4 times with 2 s / 8 s / 20 s backoff (proxies with cold starts have been observed to need 10+ s). If it still fails, the run stops and is checkpointed rather than losing its state.
 - Each `skill-state-step` entry records why rejected replies were rejected (`rejections`) and how many provider retries happened, so a run with many retries can be diagnosed from the transcript (expand the entry).
 
 ## Action vocabulary
@@ -45,7 +52,7 @@ produce an error observation, not a crash.
 | Action | Semantics |
 | --- | --- |
 | `search_files {pattern, glob?}` | `git grep -nIE --untracked` from the working directory, so ignored files (logs, build output, vendored trees) never reach the model; plain `grep -r` outside a git work tree. Up to 80 matching lines are shown in full; above that the model gets a per-file match map (top 40 files) and is asked to narrow the pattern |
-| `read_file {path, offset?, limit?}` | numbered window of a file; truncation notice tells the model how to page |
+| `read_file {path, offset?, limit?}` | numbered window of a file; truncation notice tells the model how to page. A missing path returns the entries of the nearest existing directory so the model can correct it |
 | `write_file {path, content}` | create or overwrite |
 | `patch_file {path, oldText, newText}` | replace exactly one occurrence; 0 or 2+ matches is an error |
 | `exec_shell {command, timeoutMs?}` | `sh -c` in the repo root; default 30 s, max 120 s |
@@ -56,13 +63,13 @@ produce an error observation, not a crash.
 
 ```
 runtime-owned: version, step, objective, inspectedFiles, changedFiles, checks (last 5 exec_shell results)
-model-owned:   status, plan[], hypotheses{}, facts{}, blockers[]
+model-owned:   status, plan[], hypotheses{} (short free text), facts{}, blockers[]
 ```
 
 Merge semantics (stated in the prompt): `facts` and `hypotheses` merge by key
 and `null` deletes; `plan` and `blockers` are replaced whole; patching a
 runtime-owned key is a validation error that names the key. Bounds after merge:
-24 facts (values ≤ 300 chars), 12 hypotheses, 15 plan/blocker items, 6 KB total.
+24 facts (values ≤ 300 chars), 12 hypotheses (values ≤ 200 chars), 15 plan/blocker items, 6 KB total, plus the phase rules above.
 An invalid or over-bound reply is rejected, the state is left untouched, and the
 same `(P, Σt, Ot)` prompt is re-sent with the error list appended, at most twice
 (rollback-retry, paper §7). A third rejection fails the run.

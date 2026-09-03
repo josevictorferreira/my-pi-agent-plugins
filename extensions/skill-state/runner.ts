@@ -1,7 +1,7 @@
 import { execute } from "./executor";
 import { lastFencedJson, render } from "./prompt";
 import { validateStepResponse, type RepoAction, type SkillExecutionState, type StepResponse } from "./schemas";
-import { createInitialState, merge, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
+import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
 
 // Algorithm 1 of the paper: A_t = (P, Σt, Ot) → (Rt, ΔΣt, at); Σt+1 = Σt ⊕ ΔΣt;
 // Ot+1 = env(at). Rt (the reasoning text) is dropped after parsing.
@@ -10,8 +10,8 @@ const MAX_RETRIES = 2;
 export const DEFAULT_MAX_STEPS = 40;
 // Transient provider failures (proxy 5xx/404, network resets) are retried a
 // few times with backoff before the run is checkpointed and stopped.
-const PROVIDER_ATTEMPTS = 3;
-const PROVIDER_BACKOFF_MS = [1000, 4000];
+const PROVIDER_ATTEMPTS = 4;
+const PROVIDER_BACKOFF_MS = [2000, 8000, 20000];
 
 export interface ModelReply {
   text: string;
@@ -88,6 +88,8 @@ export interface RunOptions {
   onStep: (telemetry: StepTelemetry, state: SkillExecutionState) => void;
   /** Continue from a checkpoint instead of Σ0 / workspace snapshot. */
   resume?: Checkpoint;
+  /** Operator guidance delivered as the first observation of a resumed run. */
+  resumeNote?: string;
 }
 
 async function initialObservation(cwd: string, signal: AbortSignal): Promise<string> {
@@ -122,6 +124,11 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   const specBytes = Buffer.byteLength(spec);
   let state = resume ? structuredClone(resume.state) : createInitialState(objective);
   let observation = resume ? resume.observation : await initialObservation(cwd, signal);
+  if (resume && options.resumeNote) {
+    observation =
+      "Operator note (the run was resumed; act on this before anything else):\n" + options.resumeNote +
+      "\n\nPrevious observation:\n" + resume.observation;
+  }
   const totals = resume ? { ...resume.totals } : { input: 0, output: 0, cacheRead: 0 };
   let promptTokenSum = 0;
   let maxPromptTokens = 0;
@@ -201,9 +208,12 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       errors = parsed.ok ? validateStepResponse(parsed.value) : [parsed.error];
       if (!errors.length && parsed.ok) {
         const response = parsed.value as StepResponse;
-        const merged = merge(state, response.state_patch);
-        if (merged.ok) accepted = { response, next: merged.state };
-        else errors = merged.errors;
+        const merged = merge(state, response.state_patch, { maxSteps: options.maxSteps });
+        if (!merged.ok) errors = merged.errors;
+        else {
+          errors = actionErrors(merged.state, response.action.type);
+          if (!errors.length) accepted = { response, next: merged.state };
+        }
       }
       if (!accepted) {
         retries++;
@@ -217,6 +227,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     }
 
     // Commit Σt+1, then execute at.
+    if (accepted.next.status !== state.status) accepted.next.statusSince = step;
     state = accepted.next;
     state.step = step;
     steps = step;
@@ -230,6 +241,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     maxPromptBytes = Math.max(maxPromptBytes, promptBytes);
 
     const result = await execute(action, cwd, signal);
+    recordAction(state, action.type);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
     if (action.type === "read_file" || action.type === "search_files") {
       const key = JSON.stringify(action);

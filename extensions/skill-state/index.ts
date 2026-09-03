@@ -128,10 +128,12 @@ export default function (pi: ExtensionAPI) {
       ["changed files", s.changedFiles.join(", ") || "none"],
     ];
     if (s.error) rows.push(["error", s.error]);
+    const clip = (t: string, n: number) => (expanded || t.length <= n ? t : t.slice(0, n - 1) + "…");
+    if (s.blockers.length) rows.push(["blockers", s.blockers.map((b) => clip(b, 160)).join(" | ")]);
+    if (s.summary) rows.push(["summary", clip(s.summary, 400)]);
     const width = Math.max(...rows.map(([k]) => k.length));
-    let text = theme.bold("SKILL.state run: " + s.objective) + "\n";
+    let text = theme.bold("SKILL.state run: " + clip(s.objective, 200)) + "\n";
     text += rows.map(([k, v]) => theme.fg("dim", k.padEnd(width)) + "  " + v).join("\n");
-    if (expanded && s.summary) text += "\n" + s.summary;
     return new Text(text);
   });
 
@@ -233,7 +235,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("state-resume", {
-    description: "Continue the last failed or cancelled /state-run from its checkpointed state, with the current model: /state-resume [--max-steps N]",
+    description: "Continue the last failed or cancelled /state-run from its checkpointed state, with the current model: /state-resume [--max-steps N] [note for the model]",
     handler: async (args, ctx) => {
       if (active) {
         ctx.ui.notify("A state-run is already active; use /state-cancel first", "warning");
@@ -246,6 +248,7 @@ export default function (pi: ExtensionAPI) {
       }
       const flag = /--max-steps\s+(\d+)/.exec(args);
       const maxSteps = flag ? Number(flag[1]) : checkpoint.maxSteps;
+      const note = args.replace(/--max-steps\s+\d+/, "").trim();
       if (checkpoint.state.step >= maxSteps) {
         ctx.ui.notify(
           "Checkpoint is at step " + checkpoint.state.step + "; pass --max-steps larger than that to continue",
@@ -259,6 +262,7 @@ export default function (pi: ExtensionAPI) {
         spec: checkpoint.spec,
         maxSteps,
         resume: checkpoint,
+        resumeNote: note || undefined,
       });
     },
   });
