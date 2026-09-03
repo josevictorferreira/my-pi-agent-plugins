@@ -23,19 +23,30 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 ```
 /state-run [--skill <path>] [--max-steps N] <objective>
 /state-resume [--list] [--run <runId>] [--max-steps N] [note for the model]
+/state-log [runId]
 /state-cancel
 ```
 
+## Where things live
+
+| What | Path |
+| --- | --- |
+| Per-run trace (prompts, replies, rejections, states, observations) | `~/.pi/agent/skill-state/<working-directory>/logs/<runId>.jsonl` |
+| Checkpoints of failed or cancelled runs | `~/.pi/agent/skill-state/<working-directory>/<runId>.json` |
+| Step and run entries inside the Pi session (TUI only, never in model context) | the session file under `~/.pi/agent/sessions/` |
+
+`<working-directory>` is the Pi cwd with every non-alphanumeric character replaced by `-`, the same scheme Pi uses for `sessions/`. `~/.pi/agent` moves with `PI_CODING_AGENT_DIR`. Inside Pi, `/state-log` prints the directory and lists the runs in it; `/state-log <runId>` prints one file's path. Every run summary, result message and failure notice also names its log path.
+
 - `--skill <path>`: markdown file (≤ 4 KB) used verbatim as the spec `P`. Default is the built-in inspect → plan → edit → test → repair workflow in `workflow.ts`.
-- `--max-steps N`: step cap, default 40.
+- `--max-steps N`: step cap, default 250. Per-step cost is flat, so a large default costs nothing when the run finishes early; the phase rules below keep the model from spending it on inspection.
 - One run at a time; a second `/state-run` while one is active is refused.
 - Every prompt tells the model the current step and the cap. **Phases and progress are enforced by the runtime, not just requested by the spec.** Rejected replies get the rollback-retry treatment, so the loop forces the transition the same way it forces schema compliance (prose rules alone were not followed by the models tested; validation errors were, on the first retry, every time):
-  - after a third of the budget, a patch that leaves `status` at `inspecting` is rejected;
-  - `planning` requires a non-empty `plan` and lasts at most 2 steps, then `status` must be `editing`;
+  - after a third of the budget, and never later than step 30, a patch that leaves `status` at `inspecting` is rejected;
+  - `planning` requires a non-empty `plan` and lasts at most 2 steps, then `status` must be `editing`, entered with a plan (items are removed as they are done, so the plan may be empty later);
   - in `editing`, after 3 read-only actions (`read_file`, `search_files`, `exec_shell`, `git_diff`) without a write, the next action must be `write_file`, `patch_file` or `finish`;
   - `testing` requires at least one changed file.
   The runtime tracks this in two runtime-owned state fields, `statusSince` and `readsSinceWrite`, which the model sees but cannot patch.
-- **Budget guidance.** Per-step cost is flat, so the budget is the main knob. Single-file fixes finish in 5 to 15 steps. A multi-file feature in a real application needs 60 to 100; the enforced phases mean roughly a third is inspection, two steps are planning, and the rest is edit and test cycles.
+- **Budget guidance.** Single-file fixes finish in 5 to 15 steps. A multi-file feature in a real application has needed 60 to 100. The default of 250 leaves room for repair cycles; lower it with `--max-steps` when you want a hard stop.
 - The built-in spec asks for `cannot_complete` only when the objective needs information no action can obtain (URLs, production data, decisions only the user can make). Something the objective asks to add and that does not exist yet is the work, not a blocker.
 - An identical `read_file` or `search_files` repeated with no intervening write is still executed, but its observation is prefixed with a note saying it already ran at step *k* and nothing changed. Writes clear that memory.
 - The run uses the session's current model with no provider thinking (reasoning is textual, as in the paper's Appendix A.4). No sampling temperature is sent by default because some upstreams reject the parameter; set `SKILL_STATE_TEMPERATURE=0` to reproduce the paper's decoding on a model that accepts it.
@@ -73,6 +84,30 @@ runtime-owned key is a validation error that names the key. Bounds after merge:
 An invalid or over-bound reply is rejected, the state is left untouched, and the
 same `(P, Σt, Ot)` prompt is re-sent with the error list appended, at most twice
 (rollback-retry, paper §7). A third rejection fails the run.
+
+## Debugging a run: the per-run log
+
+Every run writes a JSONL trace to `~/.pi/agent/skill-state/<working-directory>/logs/<runId>.jsonl`, appended synchronously as the run goes, so a hang or crash leaves the trail up to that point. A resumed run appends to the same file. The run summary, the result message and the failure notice all name the path. Records:
+
+| `type` | Contents |
+| --- | --- |
+| `run_start` | run id, objective, budget, model, spec, cwd, `resumedFrom` |
+| `attempt` | one per model call that returned: full prompt, raw reply (with the discarded reasoning), usage, validation/merge errors (empty when accepted), duration |
+| `provider_error` | one per failed model call: attempt number, error, duration |
+| `step` | committed step: action, `state_patch`, state after merge, observation, telemetry |
+| `run_end` | the run summary |
+
+`/state-log` inside Pi shows the folder and the runs. Inspect a run with the bundled tool (`bun`, no build, run from this repo):
+
+```
+bun extensions/skill-state/tools/runlog.ts                       # runs for the current directory
+bun extensions/skill-state/tools/runlog.ts <runId>               # step table and summary
+bun extensions/skill-state/tools/runlog.ts <runId> --rejections  # why replies were rejected
+bun extensions/skill-state/tools/runlog.ts <runId> --step 12     # patch, action, observation, state after step 12
+bun extensions/skill-state/tools/runlog.ts <runId> --step 12 --prompt|--reply [--attempt K]
+```
+
+`--cwd <dir>` looks at another project's logs. Size is roughly 20 to 30 KB per step.
 
 ## What lands in the Pi session
 

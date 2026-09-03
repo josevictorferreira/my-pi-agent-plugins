@@ -3,6 +3,7 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
 import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepTelemetry } from "./runner";
 import { listCheckpoints, loadCheckpoint, removeCheckpoint, saveCheckpoint } from "./checkpoints";
+import { listRunLogs, openRunLog, runLogDir } from "./runlog";
 import { loadSpec } from "./workflow";
 
 const MAX_RESULT_CHARS = 1024;
@@ -81,6 +82,7 @@ function resultMessage(summary: RunSummary): string {
   if (summary.summary) lines.push("Summary: " + summary.summary);
   if (summary.error) lines.push("Error: " + summary.error);
   if (summary.checkpoint) lines.push("Checkpointed at step " + summary.steps + "; continue with /state-resume.");
+  if (summary.logPath) lines.push("Log: " + summary.logPath);
   if (summary.changedFiles.length) lines.push("Changed files: " + summary.changedFiles.join(", "));
   if (summary.blockers.length) lines.push("Blockers: " + summary.blockers.join("; "));
   if (summary.checks.length) {
@@ -129,6 +131,7 @@ export default function (pi: ExtensionAPI) {
       ["changed files", s.changedFiles.join(", ") || "none"],
     ];
     if (s.error) rows.push(["error", s.error]);
+    if (s.logPath) rows.push(["log", s.logPath]);
     const clip = (t: string, n: number) => (expanded || t.length <= n ? t : t.slice(0, n - 1) + "…");
     if (s.blockers.length) rows.push(["blockers", s.blockers.map((b) => clip(b, 160)).join(" | ")]);
     if (s.summary) rows.push(["summary", clip(s.summary, 400)]);
@@ -154,7 +157,7 @@ export default function (pi: ExtensionAPI) {
     return newest ? loadCheckpoint(ctx.cwd, newest.runId) : undefined;
   }
 
-  async function launch(ctx: ExtensionCommandContext, options: Omit<RunOptions, "cwd" | "signal" | "complete" | "onStep">) {
+  async function launch(ctx: ExtensionCommandContext, options: Omit<RunOptions, "cwd" | "signal" | "complete" | "onStep" | "onEvent" | "model">) {
     let complete: CompleteFn;
     try {
       complete = await makeComplete(ctx);
@@ -162,6 +165,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(String((err as Error).message ?? err), "error");
       return;
     }
+    const log = openRunLog(ctx.cwd, options.runId);
     const controller = new AbortController();
     active = { runId: options.runId, controller };
     ctx.ui.setStatus("state-run", "step " + (options.resume?.state.step ?? 0) + " starting");
@@ -173,6 +177,8 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
         signal: controller.signal,
         complete,
+        onEvent: log.write,
+        model: ctx.model ? ctx.model.provider + "/" + ctx.model.id : undefined,
         onStep: (telemetry) => {
           pi.appendEntry("skill-state-step", telemetry);
           ctx.ui.setStatus("state-run", "step " + telemetry.step + " " + telemetry.status + " " + telemetry.actionType);
@@ -190,6 +196,7 @@ export default function (pi: ExtensionAPI) {
     } else {
       await removeCheckpoint(ctx.cwd, options.runId);
     }
+    summary.logPath = log.path;
     pi.appendEntry("skill-state-run", { ...summary, checkpoint: undefined });
     pi.sendMessage(
       { customType: "skill-state-result", content: resultMessage(summary), display: true },
@@ -296,6 +303,42 @@ export default function (pi: ExtensionAPI) {
         resume: checkpoint,
         resumeNote: note || undefined,
       });
+    },
+  });
+
+  pi.registerCommand("state-log", {
+    description: "Show where state-run logs live and list the runs for this directory: /state-log [runId]",
+    handler: async (args, ctx) => {
+      const dir = runLogDir(ctx.cwd);
+      const runs = listRunLogs(ctx.cwd);
+      const wanted = args.trim();
+      const chosen = wanted ? runs.find((r) => r.runId === wanted) : undefined;
+      if (wanted && !chosen) {
+        ctx.ui.notify("No log for run " + wanted + " in " + dir, "warning");
+        return;
+      }
+      const tool = "bun extensions/skill-state/tools/runlog.ts";
+      const lines = ["state-run logs for this directory: " + dir, ""];
+      if (chosen) {
+        lines.push(chosen.runId + "  " + chosen.steps + " steps  " + chosen.outcome, chosen.path, "");
+        lines.push("Inspect: " + tool + " " + chosen.runId + " [--rejections | --step N [--prompt|--reply]]  (run from the plugin repo, add --cwd " + ctx.cwd + ")");
+      } else if (!runs.length) {
+        lines.push("No runs logged yet. Every /state-run writes <runId>.jsonl here as it goes.");
+      } else {
+        for (const r of runs.slice(0, 20)) {
+          lines.push(
+            r.runId + "  " + r.modified.toISOString().slice(0, 16) + "  " + r.steps + " steps  " + r.outcome +
+              "  " + (r.objective.length > 60 ? r.objective.slice(0, 59) + "…" : r.objective),
+          );
+        }
+        if (runs.length > 20) lines.push("… " + (runs.length - 20) + " more");
+        lines.push("", "Inspect: " + tool + " <runId>  (run from the plugin repo, add --cwd " + ctx.cwd + "); /state-log <runId> for one path");
+      }
+      pi.sendMessage(
+        { customType: "skill-state-log", content: lines.join("\n"), display: true },
+        { triggerTurn: false, deliverAs: "nextTurn" },
+      );
+      ctx.ui.notify(chosen ? chosen.path : runs.length + " run log(s) in " + dir, "info");
     },
   });
 

@@ -1,13 +1,13 @@
 import { execute } from "./executor";
 import { lastFencedJson, render } from "./prompt";
-import { validateStepResponse, type RepoAction, type SkillExecutionState, type StepResponse } from "./schemas";
+import { validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
 import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
 
 // Algorithm 1 of the paper: A_t = (P, Σt, Ot) → (Rt, ΔΣt, at); Σt+1 = Σt ⊕ ΔΣt;
 // Ot+1 = env(at). Rt (the reasoning text) is dropped after parsing.
 
 const MAX_RETRIES = 2;
-export const DEFAULT_MAX_STEPS = 40;
+export const DEFAULT_MAX_STEPS = 250;
 // Transient provider failures (proxy 5xx/404, network resets) are retried a
 // few times with backoff before the run is checkpointed and stopped.
 const PROVIDER_ATTEMPTS = 4;
@@ -42,6 +42,14 @@ export interface StepTelemetry {
 
 export type RunStatus = "completed" | "failed" | "cancelled";
 
+/** Full trace of a run, for the per-run JSONL log. Emitted as it happens. */
+export type RunEvent =
+  | { type: "run_start"; runId: string; objective: string; maxSteps: number; resumedFrom?: number; spec: string; cwd: string; model?: string }
+  | { type: "attempt"; step: number; attempt: number; prompt: string; reply: string; usage?: ModelReply["usage"]; errors: string[]; durationMs: number }
+  | { type: "provider_error"; step: number; attempt: number; error: string; durationMs: number }
+  | { type: "step"; step: number; action: RepoAction; statePatch: StatePatch; state: SkillExecutionState; observation: string; telemetry: StepTelemetry }
+  | { type: "run_end"; summary: RunSummary };
+
 /** Everything needed to continue a run from Σt with any model (paper Table 3). */
 export interface Checkpoint {
   runId: string;
@@ -75,6 +83,8 @@ export interface RunSummary {
   blockers: string[];
   /** Present when status is not "completed": resume with `/state-resume`. */
   checkpoint?: Checkpoint;
+  /** Per-run JSONL trace, set by the extension entry point. */
+  logPath?: string;
 }
 
 export interface RunOptions {
@@ -90,6 +100,10 @@ export interface RunOptions {
   resume?: Checkpoint;
   /** Operator guidance delivered as the first observation of a resumed run. */
   resumeNote?: string;
+  /** Trace sink (per-run JSONL log). */
+  onEvent?: (event: RunEvent) => void;
+  /** Model name, recorded in the run_start event only. */
+  model?: string;
 }
 
 async function initialObservation(cwd: string, signal: AbortSignal): Promise<string> {
@@ -105,13 +119,16 @@ async function completeWithRetry(
   complete: CompleteFn,
   prompt: string,
   signal: AbortSignal,
+  onError: (attempt: number, error: string, durationMs: number) => void,
 ): Promise<{ reply: ModelReply; attempts: number }> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= PROVIDER_ATTEMPTS; attempt++) {
+    const started = Date.now();
     try {
       return { reply: await complete(prompt, signal), attempts: attempt };
     } catch (err) {
       lastError = err;
+      onError(attempt, String((err as Error).message ?? err), Date.now() - started);
       if (signal.aborted || attempt === PROVIDER_ATTEMPTS) break;
       await new Promise((r) => setTimeout(r, PROVIDER_BACKOFF_MS[attempt - 1]));
     }
@@ -137,13 +154,15 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   let reReadCount = resume?.reReadCount ?? 0;
   let steps = state.step;
   const firstStep = steps;
+  const emit = options.onEvent ?? (() => {});
+  emit({ type: "run_start", runId, objective, maxSteps: options.maxSteps, resumedFrom: resume ? firstStep : undefined, spec, cwd, model: options.model });
   // Identical read/search actions return identical results until a file
   // changes; tell the model so instead of letting it loop (paper §7, cond. 2).
   const seenReads = new Map<string, number>();
 
   const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => {
     const own = steps - firstStep;
-    return {
+    const summary: RunSummary = {
       runId,
       objective,
       status,
@@ -163,6 +182,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           : { runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount },
       ...extra,
     };
+    emit({ type: "run_end", summary });
+    return summary;
   };
 
   while (steps < options.maxSteps) {
@@ -187,8 +208,12 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       observationBytes = Buffer.byteLength(observation);
 
       let reply: ModelReply;
+      const attemptStarted = Date.now();
+      let attemptNo = retries + 1;
       try {
-        const attempt = await completeWithRetry(complete, prompt, signal);
+        const attempt = await completeWithRetry(complete, prompt, signal, (n, error, durationMs) =>
+          emit({ type: "provider_error", step, attempt: n, error, durationMs }),
+        );
         reply = attempt.reply;
         providerRetries += attempt.attempts - 1;
       } catch (err) {
@@ -215,6 +240,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           if (!errors.length) accepted = { response, next: merged.state };
         }
       }
+      emit({ type: "attempt", step, attempt: attemptNo, prompt, reply: reply.text, usage: reply.usage, errors: errors ?? [], durationMs: Date.now() - attemptStarted });
       if (!accepted) {
         retries++;
         rejections.push((errors ?? []).join("; ").slice(0, 300));
@@ -260,25 +286,24 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     if (result.check) recordCheck(state, result.check);
     observation = result.observation;
 
-    options.onStep(
-      {
-        runId,
-        step,
-        status: state.status,
-        actionType: action.type,
-        promptBytes,
-        specBytes,
-        stateBytes,
-        observationBytes,
-        ...usage,
-        retries,
-        rejections,
-        providerRetries,
-        reReadCount,
-        durationMs: Date.now() - started,
-      },
-      state,
-    );
+    const telemetry: StepTelemetry = {
+      runId,
+      step,
+      status: state.status,
+      actionType: action.type,
+      promptBytes,
+      specBytes,
+      stateBytes,
+      observationBytes,
+      ...usage,
+      retries,
+      rejections,
+      providerRetries,
+      reReadCount,
+      durationMs: Date.now() - started,
+    };
+    emit({ type: "step", step, action, statePatch: accepted.response.state_patch, state, observation, telemetry });
+    options.onStep(telemetry, state);
 
     if (action.type === "finish") {
       return finish(action.outcome === "completed" ? "completed" : "failed", {

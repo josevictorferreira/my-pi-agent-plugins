@@ -39,7 +39,8 @@ Single Bun/TypeScript pi package containing eight independently loaded extension
 | Understand or change the spoken-summary flow | `extensions/tts/index.ts` | `/speak` command and `ctrl+alt+s` shortcut; Velox chat summary + audio speech, local playback. |
 | Understand or change the dictation flow | `extensions/stt/index.ts` | `/dictate` command and `ctrl+alt+d` shortcut; local recording via `pw-record`/`ffmpeg`, Velox transcription, transcript appended to the prompt editor. |
 | Understand the SKILL.state design and its limits | `.agents/specs/0001-skill-state-plan.md`, `extensions/skill-state/README.md` | Paper claims vs. what is reproduced; verification gates; honesty notes. |
-| Change the state-run loop, retry, or telemetry | `extensions/skill-state/runner.ts` | Algorithm 1: render → complete → parse/validate → merge → execute; rollback-retry ≤ 2; per-step telemetry. |
+| Change the state-run loop, retry, or telemetry | `extensions/skill-state/runner.ts` | Algorithm 1: render → complete → parse/validate → merge → execute; rollback-retry ≤ 2; per-step telemetry; `onEvent` trace. |
+| Debug a state-run | `/state-log` in Pi, then `bun extensions/skill-state/tools/runlog.ts <runId> [--rejections | --step N --prompt] --cwd <project>` | Reads `~/.pi/agent/skill-state/<cwd>/logs/<runId>.jsonl`; `listRunLogs` in `runlog.ts` is shared by the command and the tool. |
 | Change the state schema, merge bounds or phase policy | `extensions/skill-state/schemas.ts`, `extensions/skill-state/state.ts` | TypeBox schemas with `additionalProperties: false`; `⊕` merge with null-delete, list replacement, 6 KB cap; `phaseErrors` and `actionErrors` enforce the inspect budget, the 2-step planning limit, read-only streaks in editing, and changed-files-before-testing as rejection errors. |
 | Change the action vocabulary or observation caps | `extensions/skill-state/executor.ts`, `extensions/skill-state/prompt.ts` | Repo-local actions, 200 lines / 8 KB observations; prompt text mirrors paper Appendix A.4. |
 | Change the built-in SE skill or `--skill` loading | `extensions/skill-state/workflow.ts` | Spec ≤ 4 KB, used verbatim as `{spec}`. |
@@ -65,6 +66,7 @@ The package has 16 TypeScript source files and no tests. Reference counts below 
 | `validateStepResponse` | function | `extensions/skill-state/schemas.ts:93` | TypeBox validation returning error paths that name offending keys. |
 | `loadSpec` | function | `extensions/skill-state/workflow.ts:35` | Built-in spec or `--skill` file, ≤ 4 KB. |
 | `saveCheckpoint` / `listCheckpoints` | functions | `extensions/skill-state/checkpoints.ts` | Per-cwd durable checkpoint files under the Pi agent dir. |
+| `openRunLog` | function | `extensions/skill-state/runlog.ts` | Per-run JSONL trace (prompts, replies, rejections, states, observations) next to the checkpoints; `tools/runlog.ts` reads it. |
 
 ## CONVENTIONS
 - Keep one directory per plugin under `extensions/`; use `index.ts` as the loader entry point and add a sibling README for a plugin contract.

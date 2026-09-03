@@ -93,9 +93,12 @@ export interface PhasePolicy {
   maxSteps: number;
 }
 
+/** Inspection never needs more than this many steps, whatever the run budget. */
+export const MAX_INSPECT_STEPS = 30;
+
 /** Steps the run may spend in `inspecting` before a plan is required. */
 export function inspectBudget(maxSteps: number): number {
-  return Math.max(2, Math.ceil(maxSteps / 3));
+  return Math.min(MAX_INSPECT_STEPS, Math.max(2, Math.ceil(maxSteps / 3)));
 }
 
 /** `planning` is where the plan gets written; after this many steps the run must edit. */
@@ -123,8 +126,8 @@ function phaseErrors(prev: SkillExecutionState, next: SkillExecutionState, patch
   if (patch.status === "planning" && next.plan.length === 0) {
     errors.push('/plan: entering "planning" requires a non-empty plan (ordered concrete edits, each with the check that proves it).');
   }
-  if ((patch.status === "editing" || patch.status === "testing") && next.plan.length === 0 && next.status !== "repairing") {
-    errors.push("/plan: status \"" + patch.status + "\" requires a plan; write it first.");
+  if (patch.status === "editing" && prev.status !== "editing" && next.plan.length === 0 && prev.status !== "repairing") {
+    errors.push('/plan: entering "editing" requires a plan; write it first.');
   }
   if (patch.status === "testing" && prev.status !== "testing" && next.changedFiles.length === 0) {
     errors.push('/status: "testing" requires at least one changed file; nothing has been edited yet. Stay in "editing" and apply the first plan item.');
