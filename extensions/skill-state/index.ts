@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { complete } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
 import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepTelemetry } from "./runner";
+import { listCheckpoints, loadCheckpoint, removeCheckpoint, saveCheckpoint } from "./checkpoints";
 import { loadSpec } from "./workflow";
 
 const MAX_RESULT_CHARS = 1024;
@@ -141,14 +142,16 @@ export default function (pi: ExtensionAPI) {
   // "skill-state-checkpoint" entry so it survives a Pi restart.
   let lastCheckpoint: Checkpoint | undefined;
 
-  function findCheckpoint(ctx: ExtensionCommandContext): Checkpoint | undefined {
+  /** In-memory → this session's entries → newest checkpoint file for this directory. */
+  async function findCheckpoint(ctx: ExtensionCommandContext): Promise<Checkpoint | undefined> {
     if (lastCheckpoint) return lastCheckpoint;
     const entries = ctx.sessionManager.getBranch();
     for (let i = entries.length - 1; i >= 0; i--) {
       const entry = entries[i];
       if (entry.type === "custom" && entry.customType === "skill-state-checkpoint") return entry.data as Checkpoint;
     }
-    return undefined;
+    const newest = (await listCheckpoints(ctx.cwd))[0];
+    return newest ? loadCheckpoint(ctx.cwd, newest.runId) : undefined;
   }
 
   async function launch(ctx: ExtensionCommandContext, options: Omit<RunOptions, "cwd" | "signal" | "complete" | "onStep">) {
@@ -181,7 +184,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     lastCheckpoint = summary.checkpoint;
-    if (summary.checkpoint) pi.appendEntry("skill-state-checkpoint", summary.checkpoint);
+    if (summary.checkpoint) {
+      pi.appendEntry("skill-state-checkpoint", summary.checkpoint);
+      await saveCheckpoint(ctx.cwd, summary.checkpoint);
+    } else {
+      await removeCheckpoint(ctx.cwd, options.runId);
+    }
     pi.appendEntry("skill-state-run", { ...summary, checkpoint: undefined });
     pi.sendMessage(
       { customType: "skill-state-result", content: resultMessage(summary), display: true },
@@ -193,7 +201,7 @@ export default function (pi: ExtensionAPI) {
     } else {
       ctx.ui.notify(
         "state-run " + summary.status + " at step " + summary.steps + " (" + tokens + " tokens). " +
-          "State is checkpointed: switch model if needed, then /state-resume [--max-steps N]",
+          "Checkpoint " + summary.runId + " saved: switch model if needed, then /state-resume [--max-steps N] [note]",
         "warning",
       );
     }
@@ -235,20 +243,44 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("state-resume", {
-    description: "Continue the last failed or cancelled /state-run from its checkpointed state, with the current model: /state-resume [--max-steps N] [note for the model]",
+    description:
+      "Continue a failed or cancelled /state-run from its checkpoint with the current model: " +
+      "/state-resume [--list] [--run <runId>] [--max-steps N] [note for the model]",
     handler: async (args, ctx) => {
+      if (/(^|\s)--list(\s|$)/.test(args)) {
+        const infos = await listCheckpoints(ctx.cwd);
+        if (!infos.length) {
+          ctx.ui.notify("No checkpointed state-runs for " + ctx.cwd, "info");
+          return;
+        }
+        const lines = infos.map(
+          (c) =>
+            c.runId + "  step " + c.step + " " + c.status + "  " + c.savedAt.toISOString().slice(0, 16) +
+            "  " + (c.objective.length > 70 ? c.objective.slice(0, 69) + "…" : c.objective),
+        );
+        pi.sendMessage(
+          { customType: "skill-state-list", content: "Checkpointed state-runs (newest first):\n" + lines.join("\n"), display: true },
+          { triggerTurn: false, deliverAs: "nextTurn" },
+        );
+        ctx.ui.notify(infos.length + " checkpoint(s); newest " + infos[0].runId + ". Resume with /state-resume --run <runId>", "info");
+        return;
+      }
       if (active) {
         ctx.ui.notify("A state-run is already active; use /state-cancel first", "warning");
         return;
       }
-      const checkpoint = findCheckpoint(ctx);
+      const runFlag = /--run\s+(\S+)/.exec(args);
+      const checkpoint = runFlag ? await loadCheckpoint(ctx.cwd, runFlag[1]) : await findCheckpoint(ctx);
       if (!checkpoint) {
-        ctx.ui.notify("No checkpointed state-run in this session", "info");
+        ctx.ui.notify(
+          runFlag ? "No checkpoint " + runFlag[1] + " for this directory; see /state-resume --list" : "No checkpointed state-run for this directory",
+          "info",
+        );
         return;
       }
       const flag = /--max-steps\s+(\d+)/.exec(args);
       const maxSteps = flag ? Number(flag[1]) : checkpoint.maxSteps;
-      const note = args.replace(/--max-steps\s+\d+/, "").trim();
+      const note = args.replace(/--max-steps\s+\d+/, "").replace(/--run\s+\S+/, "").trim();
       if (checkpoint.state.step >= maxSteps) {
         ctx.ui.notify(
           "Checkpoint is at step " + checkpoint.state.step + "; pass --max-steps larger than that to continue",
