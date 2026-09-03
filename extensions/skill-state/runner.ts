@@ -88,6 +88,9 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   let maxPromptBytes = 0;
   let reReadCount = 0;
   let steps = 0;
+  // Identical read/search actions return identical results until a file
+  // changes; tell the model so instead of letting it loop (paper §7, cond. 2).
+  const seenReads = new Map<string, number>();
 
   const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => ({
     runId,
@@ -120,7 +123,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 
     // Rollback-retry: every attempt is a fresh (P, Σt, Ot [+ errors]) prompt.
     while (!accepted) {
-      const prompt = render(spec, state, observation, errors);
+      const prompt = render(spec, state, observation, options.maxSteps, errors);
       promptBytes = Buffer.byteLength(prompt);
       stateBytes = Buffer.byteLength(serializeState(state));
       observationBytes = Buffer.byteLength(observation);
@@ -170,6 +173,18 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 
     const result = await execute(action, cwd, signal);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
+    if (action.type === "read_file" || action.type === "search_files") {
+      const key = JSON.stringify(action);
+      const earlier = seenReads.get(key);
+      if (earlier !== undefined) {
+        result.observation =
+          "Note: this exact action already ran at step " + earlier + " and nothing changed since. " +
+          "Record what you need in facts instead of repeating it.\n" + result.observation;
+      }
+      seenReads.set(key, step);
+    } else if (result.changed) {
+      seenReads.clear();
+    }
     for (const path of result.inspected ?? []) recordInspected(state, path);
     if (result.changed) recordChanged(state, result.changed);
     if (result.check) recordCheck(state, result.check);

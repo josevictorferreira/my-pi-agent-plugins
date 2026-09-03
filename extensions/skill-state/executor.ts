@@ -13,6 +13,8 @@ const HEAD_SHARE = 0.7;
 const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 120_000;
 const SEARCH_MAX_LINE_CHARS = 300;
+const MAX_SEARCH_LINES = 80;
+const MAX_SEARCH_FILES = 40;
 
 export interface ExecutionResult {
   observation: string;
@@ -93,12 +95,9 @@ function boundOutput(text: string): string {
   );
 }
 
-async function searchFiles(cwd: string, pattern: string, glob: string | undefined, signal: AbortSignal): Promise<string> {
-  const args = ["-rnIE", "--exclude-dir=.git", "--exclude-dir=node_modules"];
-  if (glob) args.push("--include=" + glob);
-  args.push("-e", pattern, ".");
-  const result = await new Promise<ShellResult>((done) => {
-    const child = spawn("grep", args, { cwd, stdio: ["ignore", "pipe", "pipe"], signal });
+function spawnCollect(cmd: string, args: string[], cwd: string, signal: AbortSignal): Promise<ShellResult> {
+  return new Promise((done) => {
+    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], signal });
     const chunks: Buffer[] = [];
     child.stdout.on("data", (c: Buffer) => chunks.push(c));
     child.stderr.on("data", (c: Buffer) => chunks.push(c));
@@ -107,23 +106,62 @@ async function searchFiles(cwd: string, pattern: string, glob: string | undefine
       done({ code: code ?? -1, output: Buffer.concat(chunks).toString("utf8"), timedOut: false, aborted: signal.aborted }),
     );
   });
-  if (result.code === 1) return "No matches for /" + pattern + "/" + (glob ? " in " + glob : "");
-  if (result.code !== 0) return "grep failed (exit " + result.code + "):\n" + result.output;
-  const lines = result.output
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => (l.startsWith("./") ? l.slice(2) : l))
-    .map((l) => (l.length > SEARCH_MAX_LINE_CHARS ? l.slice(0, SEARCH_MAX_LINE_CHARS) + " [truncated]" : l));
-  return lines.length + " matching lines:\n" + lines.join("\n");
 }
 
-function matchedPaths(searchOutput: string): string[] {
-  const paths = new Set<string>();
-  for (const line of searchOutput.split("\n")) {
-    const m = /^([^:\n]+):\d+:/.exec(line);
-    if (m) paths.add(m[1]);
+/**
+ * Search tracked and untracked-but-not-ignored files with `git grep`, so build
+ * output, logs and vendored trees never reach the model. Outside a git work
+ * tree fall back to `grep -r`. Returns the raw `path:line:text` lines.
+ */
+async function grepLines(cwd: string, pattern: string, glob: string | undefined, signal: AbortSignal): Promise<string[]> {
+  let result = await spawnCollect(
+    "git",
+    ["grep", "-nIE", "--untracked", "--no-color", "-e", pattern, ...(glob ? ["--", glob] : [])],
+    cwd,
+    signal,
+  );
+  // 128 = not a git repository (or another git error); fall back to plain grep.
+  if (result.code === 128) {
+    const args = ["-rnIE", "--exclude-dir=.git", "--exclude-dir=node_modules"];
+    if (glob) args.push("--include=" + glob);
+    result = await spawnCollect("grep", [...args, "-e", pattern, "."], cwd, signal);
   }
-  return [...paths];
+  if (result.code === 1) return [];
+  if (result.code !== 0) throw new Error("search failed (exit " + result.code + "): " + result.output.trim());
+  return result.output
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => (l.startsWith("./") ? l.slice(2) : l));
+}
+
+/**
+ * Bounded search observation. Up to MAX_SEARCH_LINES matches are shown in
+ * full. Above that, listing a random window of lines tells the model nothing,
+ * so it gets a per-file match map and is asked to narrow the pattern.
+ */
+function formatSearch(lines: string[], pattern: string, glob: string | undefined): { text: string; shown: string[] } {
+  const scope = "/" + pattern + "/" + (glob ? " in " + glob : "");
+  if (lines.length === 0) return { text: "No matches for " + scope, shown: [] };
+  const byFile = new Map<string, number>();
+  for (const line of lines) {
+    const path = line.slice(0, line.indexOf(":"));
+    byFile.set(path, (byFile.get(path) ?? 0) + 1);
+  }
+  if (lines.length <= MAX_SEARCH_LINES) {
+    const text =
+      lines.length + " matches in " + byFile.size + " files for " + scope + ":\n" +
+      lines.map((l) => (l.length > SEARCH_MAX_LINE_CHARS ? l.slice(0, SEARCH_MAX_LINE_CHARS) + " [truncated]" : l)).join("\n");
+    return { text, shown: [...byFile.keys()] };
+  }
+  const ranked = [...byFile.entries()].sort((a, b) => b[1] - a[1]);
+  const top = ranked.slice(0, MAX_SEARCH_FILES);
+  const text =
+    lines.length + " matches in " + byFile.size + " files for " + scope + ". Too many to list; matches per file" +
+    (ranked.length > top.length ? " (top " + top.length + ")" : "") +
+    ":\n" +
+    top.map(([path, n]) => path + " (" + n + ")").join("\n") +
+    "\nNarrow the pattern (use identifiers, not words) or add a glob, or read_file one of these paths.";
+  return { text, shown: [] };
 }
 
 async function readFileWindow(cwd: string, path: string, offset: number | undefined, limit: number | undefined): Promise<string> {
@@ -164,8 +202,9 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
   try {
     switch (action.type) {
       case "search_files": {
-        const out = await searchFiles(cwd, action.pattern, action.glob, signal);
-        return { observation: header + boundOutput(out), inspected: matchedPaths(out) };
+        const lines = await grepLines(cwd, action.pattern, action.glob, signal);
+        const { text, shown } = formatSearch(lines, action.pattern, action.glob);
+        return { observation: header + boundOutput(text), inspected: shown };
       }
       case "read_file": {
         const out = await readFileWindow(cwd, action.path, action.offset, action.limit);

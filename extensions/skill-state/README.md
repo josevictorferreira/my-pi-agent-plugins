@@ -28,7 +28,9 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 - `--skill <path>`: markdown file (≤ 4 KB) used verbatim as the spec `P`. Default is the built-in inspect → plan → edit → test → repair workflow in `workflow.ts`.
 - `--max-steps N`: step cap, default 40.
 - One run at a time; a second `/state-run` while one is active is refused.
-- The run uses the session's current model at `temperature: 0`, with no provider thinking (reasoning is textual, as in the paper's Appendix A.4).
+- Every prompt tells the model the current step and the cap, so it can budget inspection against editing and testing. The built-in spec asks for at most a third of the budget on inspection and for an early `cannot_complete` when the objective needs information no action can obtain (URLs, production data, decisions only the user can make).
+- An identical `read_file` or `search_files` repeated with no intervening write is still executed, but its observation is prefixed with a note saying it already ran at step *k* and nothing changed. Writes clear that memory.
+- The run uses the session's current model with no provider thinking (reasoning is textual, as in the paper's Appendix A.4). No sampling temperature is sent by default because some upstreams reject the parameter; set `SKILL_STATE_TEMPERATURE=0` to reproduce the paper's decoding on a model that accepts it.
 - `/state-cancel` or session shutdown aborts the run and kills any running child process.
 
 ## Action vocabulary
@@ -38,7 +40,7 @@ produce an error observation, not a crash.
 
 | Action | Semantics |
 | --- | --- |
-| `search_files {pattern, glob?}` | `grep -rnE` under the repo root, excluding `.git` and `node_modules` |
+| `search_files {pattern, glob?}` | `git grep -nIE --untracked` from the working directory, so ignored files (logs, build output, vendored trees) never reach the model; plain `grep -r` outside a git work tree. Up to 80 matching lines are shown in full; above that the model gets a per-file match map (top 40 files) and is asked to narrow the pattern |
 | `read_file {path, offset?, limit?}` | numbered window of a file; truncation notice tells the model how to page |
 | `write_file {path, content}` | create or overwrite |
 | `patch_file {path, oldText, newText}` | replace exactly one occurrence; 0 or 2+ matches is an error |

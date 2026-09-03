@@ -89,7 +89,7 @@ The package has 16 TypeScript source files and no tests. Reference counts below 
 - LSP starts one stdio client per `(server, root)` lazily on first matching file touch; automatic edit/write feedback reports only severity-1 diagnostics, capped at 20 per file.
 - Web-tools and Context7 are thin HTTP adapters. Their README files are the source of truth for endpoint contracts and exposed parameters.
 - TTS and STT are user-invoked only (`/speak` + `ctrl+alt+s`, `/dictate` + `ctrl+alt+d`) and expose no model-facing tool.
-- Skill-state runs its own model loop outside the Pi conversation: telemetry goes to `appendEntry` custom entries (`skill-state-step`, `skill-state-run`, never in LLM context) and one ≤ 1 KB `skill-state-result` message is queued with `deliverAs: "nextTurn"`. One run at a time; `/state-cancel` and `session_shutdown` abort it. Model calls use `temperature: 0` and no `reasoning` option on purpose.
+- Skill-state runs its own model loop outside the Pi conversation: telemetry goes to `appendEntry` custom entries (`skill-state-step`, `skill-state-run`, never in LLM context) and one ≤ 1 KB `skill-state-result` message is queued with `deliverAs: "nextTurn"`. One run at a time; `/state-cancel` and `session_shutdown` abort it. Model calls send no `reasoning` option on purpose, and no `temperature` unless `SKILL_STATE_TEMPERATURE` is set: some Velox upstreams (e.g. `gandalf`) reject the parameter with HTTP 400. `search_files` uses `git grep --untracked` so gitignored logs/build output never reach the model; `grep -r` only outside a git work tree.
 
 ## COMMANDS
 ```bash

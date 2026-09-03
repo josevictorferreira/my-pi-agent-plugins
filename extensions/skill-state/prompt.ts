@@ -33,6 +33,7 @@ export function render(
   spec: string,
   state: SkillExecutionState,
   observation: string,
+  maxSteps: number,
   rejectionErrors?: string[],
 ): string {
   let prompt =
@@ -47,7 +48,7 @@ export function render(
     "Skill Execution State:\n```json\n" +
     serializeState(state) +
     "\n```\n\n" +
-    "Latest Observation:\n" +
+    "Latest Observation (you are on step " + (state.step + 1) + " of at most " + maxSteps + "):\n" +
     observation +
     "\n\n";
   if (rejectionErrors && rejectionErrors.length) {

@@ -6,6 +6,18 @@ import { loadSpec } from "./workflow";
 
 const MAX_RESULT_CHARS = 1024;
 
+// The paper ran at temperature 0, but several upstreams behind Pi providers
+// reject the parameter outright (HTTP 400), and Pi itself never sends it.
+// Portability across models is the mechanism under test, so sampling
+// temperature is opt-in: SKILL_STATE_TEMPERATURE=0 restores the paper setting.
+function configuredTemperature(): number | undefined {
+  const raw = process.env.SKILL_STATE_TEMPERATURE;
+  if (raw === undefined || raw === "") return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) throw new Error("SKILL_STATE_TEMPERATURE must be a non-negative number");
+  return value;
+}
+
 interface ParsedArgs {
   objective: string;
   skill?: string;
@@ -32,7 +44,7 @@ function parseArgs(raw: string): ParsedArgs {
 
 /**
  * Bind the session model to the runner's `complete` contract: auth resolved once
- * per run, temperature 0, no `reasoning` option so provider thinking stays off.
+ * per run, optional temperature, no `reasoning` option so provider thinking stays off.
  */
 async function makeComplete(ctx: ExtensionCommandContext): Promise<CompleteFn> {
   const model = ctx.model;
@@ -40,11 +52,12 @@ async function makeComplete(ctx: ExtensionCommandContext): Promise<CompleteFn> {
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) throw new Error(auth.error);
   const target = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+  const temperature = configuredTemperature();
   return async (prompt, signal) => {
     const reply = await complete(
       target,
       { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal, temperature: 0 },
+      { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal, temperature },
     );
     if (reply.stopReason === "error" || reply.stopReason === "aborted") {
       throw new Error(reply.errorMessage || reply.stopReason);
