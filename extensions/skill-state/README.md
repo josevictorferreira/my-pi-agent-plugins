@@ -55,7 +55,7 @@ produce an error observation, not a crash.
 | `read_file {path, offset?, limit?}` | numbered window of a file; truncation notice tells the model how to page. A missing path returns the entries of the nearest existing directory so the model can correct it |
 | `write_file {path, content}` | create or overwrite |
 | `patch_file {path, oldText, newText}` | replace exactly one occurrence; 0 or 2+ matches is an error |
-| `exec_shell {command, timeoutMs?}` | `sh -c` in the repo root; default 30 s, max 120 s |
+| `exec_shell {command, timeoutMs?}` | `sh -c` in the repo root in its own process group; default 30 s, max 120 s. Timeout and cancel kill the whole group. The step settles when the shell exits, not when its stdio closes, so a daemon started by the command (a database server, a dev server) cannot hang the run; the observation says the process was left running |
 | `git_diff {paths?}` | uncommitted diff |
 | `finish {outcome, summary}` | end the run with `completed` or `cannot_complete` |
 

@@ -31,16 +31,41 @@ interface ShellResult {
   output: string;
   timedOut: boolean;
   aborted: boolean;
+  /** A grandchild kept stdout/stderr open after the command exited (e.g. a daemon). */
+  heldOpen: boolean;
 }
 
-function runShell(command: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<ShellResult> {
+// After the child exits, wait this long for its stdio to drain before giving
+// up on it. A daemon started by the command inherits the stdio socket and
+// would otherwise keep `close` from ever firing.
+const DRAIN_GRACE_MS = 1000;
+
+/**
+ * Run a child in its own process group, collect stdout+stderr, and settle on
+ * exit rather than on stdio close. Timeout and abort kill the whole group.
+ */
+function collect(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<ShellResult> {
   return new Promise((done) => {
-    const child = spawn("sh", ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
     const chunks: Buffer[] = [];
     let timedOut = false;
     let aborted = false;
+    let settled = false;
+    let grace: ReturnType<typeof setTimeout> | undefined;
+
     const kill = () => {
-      if (child.exitCode === null && !child.killed) child.kill("SIGKILL");
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -51,15 +76,34 @@ function runShell(command: string, cwd: string, timeoutMs: number, signal: Abort
       kill();
     };
     signal.addEventListener("abort", onAbort, { once: true });
+
+    const settle = (code: number, heldOpen: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (grace) clearTimeout(grace);
+      signal.removeEventListener("abort", onAbort);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      done({ code, output: Buffer.concat(chunks).toString("utf8"), timedOut, aborted, heldOpen });
+    };
+
     child.stdout.on("data", (c: Buffer) => chunks.push(c));
     child.stderr.on("data", (c: Buffer) => chunks.push(c));
-    child.on("error", (err) => chunks.push(Buffer.from(String(err) + "\n")));
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      done({ code: code ?? -1, output: Buffer.concat(chunks).toString("utf8"), timedOut, aborted });
+    child.on("error", (err) => {
+      chunks.push(Buffer.from(String(err) + "\n"));
+      settle(-1, false);
     });
+    child.on("exit", (code, sig) => {
+      const exitCode = code ?? (sig ? 128 : -1);
+      grace = setTimeout(() => settle(exitCode, true), DRAIN_GRACE_MS);
+    });
+    child.on("close", (code, sig) => settle(code ?? (sig ? 128 : -1), false));
   });
+}
+
+function runShell(command: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<ShellResult> {
+  return collect("sh", ["-c", command], cwd, timeoutMs, signal);
 }
 
 /** Resolve a model-supplied path under cwd; throws a plain message when it escapes. */
@@ -95,36 +139,24 @@ function boundOutput(text: string): string {
   );
 }
 
-function spawnCollect(cmd: string, args: string[], cwd: string, signal: AbortSignal): Promise<ShellResult> {
-  return new Promise((done) => {
-    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], signal });
-    const chunks: Buffer[] = [];
-    child.stdout.on("data", (c: Buffer) => chunks.push(c));
-    child.stderr.on("data", (c: Buffer) => chunks.push(c));
-    child.on("error", (err) => chunks.push(Buffer.from(String(err))));
-    child.on("close", (code) =>
-      done({ code: code ?? -1, output: Buffer.concat(chunks).toString("utf8"), timedOut: false, aborted: signal.aborted }),
-    );
-  });
-}
-
 /**
  * Search tracked and untracked-but-not-ignored files with `git grep`, so build
  * output, logs and vendored trees never reach the model. Outside a git work
  * tree fall back to `grep -r`. Returns the raw `path:line:text` lines.
  */
 async function grepLines(cwd: string, pattern: string, glob: string | undefined, signal: AbortSignal): Promise<string[]> {
-  let result = await spawnCollect(
+  let result = await collect(
     "git",
     ["grep", "-nIE", "--untracked", "--no-color", "-e", pattern, ...(glob ? ["--", glob] : [])],
     cwd,
+    DEFAULT_TIMEOUT_MS,
     signal,
   );
   // 128 = not a git repository (or another git error); fall back to plain grep.
   if (result.code === 128) {
     const args = ["-rnIE", "--exclude-dir=.git", "--exclude-dir=node_modules"];
     if (glob) args.push("--include=" + glob);
-    result = await spawnCollect("grep", [...args, "-e", pattern, "."], cwd, signal);
+    result = await collect("grep", [...args, "-e", pattern, "."], cwd, DEFAULT_TIMEOUT_MS, signal);
   }
   if (result.code === 1) return [];
   if (result.code !== 0) throw new Error("search failed (exit " + result.code + "): " + result.output.trim());
@@ -267,7 +299,10 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
           : result.timedOut
             ? "timed out after " + timeoutMs + " ms"
             : "exit code " + result.code;
-        const body = "$ " + action.command + "\n" + status + "\n" + boundOutput(result.output);
+        const note = result.heldOpen
+          ? "\n[a background process started by this command is still running and kept its output open; output may be incomplete]"
+          : "";
+        const body = "$ " + action.command + "\n" + status + note + "\n" + boundOutput(result.output);
         const lastLine = result.output.trim().split("\n").pop() ?? "";
         return {
           observation: header + body,
