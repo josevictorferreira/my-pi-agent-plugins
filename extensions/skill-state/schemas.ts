@@ -1,4 +1,4 @@
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 
 // SKILL.state schema (paper §3.1). Runtime-owned fields are never accepted in a
@@ -72,6 +72,10 @@ export const RepoActionSchema = Type.Union([
   ),
   Type.Object({ type: Type.Literal("git_diff"), paths: Type.Optional(Type.Array(Type.String())) }, strict),
   Type.Object(
+    { type: Type.Literal("tool"), name: Type.String(), params: Type.Object({}, { additionalProperties: true }) },
+    strict,
+  ),
+  Type.Object(
     {
       type: Type.Literal("finish"),
       outcome: Type.Union([Type.Literal("completed"), Type.Literal("cannot_complete")]),
@@ -88,14 +92,42 @@ export const StepResponseSchema = Type.Object(
 );
 export type StepResponse = Static<typeof StepResponseSchema>;
 
-/** Validate a parsed reply. Returns human-readable error lines, empty when valid. */
+export const ACTION_TYPES = ["search_files", "read_file", "write_file", "patch_file", "exec_shell", "git_diff", "tool", "finish"] as const;
+
+// One schema per action type so a known type is validated against its own
+// branch and the errors say exactly which field is missing or wrong.
+const ACTION_BRANCHES = new Map<string, TSchema>(
+  (RepoActionSchema as any).anyOf.map((branch: any) => [branch.properties.type.const as string, branch as TSchema]),
+);
+
+function describe(prefix: string, e: { instancePath: string; keyword: string; message: string; params: any }): string {
+  const path = prefix + (e.instancePath || "");
+  if (e.keyword === "additionalProperties") return path + ": unknown or runtime-owned keys: " + e.params.additionalProperties.join(", ");
+  if (path === "/state_patch/status") return path + ": must be one of " + STATUSES.join(", ");
+  return path + ": " + e.message;
+}
+
+/**
+ * Validate a parsed reply. Returns human-readable error lines, empty when
+ * valid. Enum-style failures name the allowed values instead of TypeBox's
+ * "must be equal to constant", and the action is checked against the schema
+ * of its own type so a missing field is reported once.
+ */
 export function validateStepResponse(value: unknown): string[] {
   if (Value.Check(StepResponseSchema, value)) return [];
-  return Value.Errors(StepResponseSchema, value).map((e) => {
-    const path = e.instancePath || "/";
-    if (e.keyword === "additionalProperties") {
-      return path + ": unknown or runtime-owned keys: " + e.params.additionalProperties.join(", ");
-    }
-    return path + ": " + e.message;
-  });
+  const out: string[] = [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return ["/: must be an object with state_patch and action"];
+  const v = value as Record<string, unknown>;
+  for (const key of Object.keys(v)) if (key !== "state_patch" && key !== "action") out.push("/: unknown key " + key);
+  if (v.state_patch === undefined) out.push("/state_patch: required");
+  else for (const e of Value.Errors(StatePatchSchema, v.state_patch)) out.push(describe("/state_patch", e));
+  const action = v.action as any;
+  if (action === undefined) out.push("/action: required");
+  else if (!action || typeof action !== "object") out.push("/action: must be an object");
+  else {
+    const branch = ACTION_BRANCHES.get(action.type);
+    if (!branch) out.push("/action/type: must be one of " + ACTION_TYPES.join(", ") + " (got " + JSON.stringify(action.type) + ")");
+    else for (const e of Value.Errors(branch, action)) out.push(describe("/action", e));
+  }
+  return [...new Set(out)];
 }

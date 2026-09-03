@@ -10,6 +10,7 @@ import { existsSync } from "node:fs";
 import { delimiter, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { type Diagnostic, LspClient, fileUri } from "./client";
 import { type LspServerConfig, findRoot, isDisabledByEnv, loadConfig } from "./servers";
+import { stateRunTool } from "../skill-state/tool-registry";
 
 /** opencode's cap: enough to act on, not enough to flood the context window. */
 const MAX_DIAGNOSTICS_PER_FILE = 20;
@@ -185,7 +186,7 @@ export default function (pi: ExtensionAPI) {
 
   // --- lsp tool -------------------------------------------------------------
 
-  pi.registerTool({
+  pi.registerTool(stateRunTool({
     name: "lsp",
     label: "LSP",
     description:
@@ -321,7 +322,7 @@ export default function (pi: ExtensionAPI) {
         details: { operation: params.operation, servers: targets.map((c) => c.id) },
       };
     },
-  });
+  }));
 
   // --- /lsp status ----------------------------------------------------------
 

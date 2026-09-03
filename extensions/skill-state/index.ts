@@ -4,6 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepTelemetry } from "./runner";
 import { listCheckpoints, loadCheckpoint, removeCheckpoint, saveCheckpoint } from "./checkpoints";
 import { listRunLogs, openRunLog, runLogDir } from "./runlog";
+import { hasStateRunTool, listStateRunTools, runStateRunTool, validateToolParams } from "./tool-registry";
 import { loadSpec } from "./workflow";
 
 const MAX_RESULT_CHARS = 1024;
@@ -24,14 +25,18 @@ interface ParsedArgs {
   objective: string;
   skill?: string;
   maxSteps: number;
+  requireReasoning: boolean;
+  noTools: boolean;
 }
 
-/** `/state-run [--skill <path>] [--max-steps N] <objective>` */
+/** `/state-run [--skill <path>] [--max-steps N] [--reasoning required|optional] [--no-tools] <objective>` */
 function parseArgs(raw: string): ParsedArgs {
   const tokens = raw.trim().split(/\s+/).filter(Boolean);
   const rest: string[] = [];
   let skill: string | undefined;
   let maxSteps = DEFAULT_MAX_STEPS;
+  let requireReasoning = false;
+  let noTools = false;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     if (token === "--skill" && tokens[i + 1]) skill = tokens[++i];
@@ -39,9 +44,29 @@ function parseArgs(raw: string): ParsedArgs {
       const n = Number.parseInt(tokens[++i], 10);
       if (!Number.isFinite(n) || n < 1) throw new Error("--max-steps must be a positive integer");
       maxSteps = n;
-    } else rest.push(token);
+    } else if (token === "--reasoning" && tokens[i + 1]) {
+      const v = tokens[++i];
+      if (v !== "required" && v !== "optional") throw new Error("--reasoning must be required or optional");
+      requireReasoning = v === "required";
+    } else if (token === "--no-tools") noTools = true;
+    else rest.push(token);
   }
-  return { objective: rest.join(" "), skill, maxSteps };
+  return { objective: rest.join(" "), skill, maxSteps, requireReasoning, noTools };
+}
+
+/** Extension tools shared through tool-registry.ts, as the runner expects them. */
+function toolRunner(ctx: ExtensionCommandContext): RunOptions["tools"] {
+  const specs = listStateRunTools();
+  if (!specs.length) return undefined;
+  const vocabulary =
+    "Extension tools, as {\"type\":\"tool\",\"name\":\"<name>\",\"params\":{...}} (read-only; results are bounded like any observation):\n" +
+    specs.map((t) => "- " + t.name + " {" + t.params.join(", ") + "}  " + t.description).join("\n");
+  return {
+    vocabulary,
+    has: hasStateRunTool,
+    validate: validateToolParams,
+    run: (name, params, signal) => runStateRunTool(name, params, signal, ctx),
+  };
 }
 
 /**
@@ -90,6 +115,7 @@ function resultMessage(summary: RunSummary): string {
       "Last checks: " + summary.checks.map((c) => "`" + c.command + "` → " + c.code).join("; "),
     );
   }
+  lines.push("Steps: " + summary.steps + " of " + summary.maxSteps);
   lines.push(
     "Tokens: " +
       (summary.totals.input + summary.totals.output) +
@@ -245,6 +271,8 @@ export default function (pi: ExtensionAPI) {
         objective: parsed.objective,
         spec,
         maxSteps: parsed.maxSteps,
+        requireReasoning: parsed.requireReasoning,
+        tools: parsed.noTools ? undefined : toolRunner(ctx),
       });
     },
   });
@@ -252,7 +280,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("state-resume", {
     description:
       "Continue a failed or cancelled /state-run from its checkpoint with the current model: " +
-      "/state-resume [--list] [--run <runId>] [--max-steps N] [note for the model]",
+      "/state-resume [--list] [--run <runId>] [--max-steps N] [--reasoning required] [--no-tools] [note for the model]",
     handler: async (args, ctx) => {
       if (/(^|\s)--list(\s|$)/.test(args)) {
         const infos = await listCheckpoints(ctx.cwd);
@@ -287,7 +315,22 @@ export default function (pi: ExtensionAPI) {
       }
       const flag = /--max-steps\s+(\d+)/.exec(args);
       const maxSteps = flag ? Number(flag[1]) : checkpoint.maxSteps;
-      const note = args.replace(/--max-steps\s+\d+/, "").replace(/--run\s+\S+/, "").trim();
+      const requireReasoning = /--reasoning\s+required/.test(args);
+      const noTools = /(^|\s)--no-tools(\s|$)/.test(args);
+      const note = args
+        .replace(/--max-steps\s+\d+/, "")
+        .replace(/--run\s+\S+/, "")
+        .replace(/--reasoning\s+\S+/, "")
+        .replace(/(^|\s)--no-tools(?=\s|$)/, "")
+        .trim();
+      if (checkpoint.outcome === "cannot_complete" && !note && maxSteps <= checkpoint.maxSteps) {
+        ctx.ui.notify(
+          "Run " + checkpoint.runId + " ended with cannot_complete. Resuming the same state unchanged repeats that answer: " +
+            "add a note answering its blockers (/state-resume <note>) or a larger --max-steps.",
+          "warning",
+        );
+        return;
+      }
       if (checkpoint.state.step >= maxSteps) {
         ctx.ui.notify(
           "Checkpoint is at step " + checkpoint.state.step + "; pass --max-steps larger than that to continue",
@@ -302,6 +345,8 @@ export default function (pi: ExtensionAPI) {
         maxSteps,
         resume: checkpoint,
         resumeNote: note || undefined,
+        requireReasoning,
+        tools: noTools ? undefined : toolRunner(ctx),
       });
     },
   });

@@ -15,6 +15,7 @@ import { complete } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { basename, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
+import { stateRunTool } from "../skill-state/tool-registry";
 
 const DEFAULT_API_URL = "https://hindsight-api.josevictor.me";
 const USER_BANK = process.env.HINDSIGHT_USER_BANK || "pi-agent-user";
@@ -455,7 +456,7 @@ export default function (pi: ExtensionAPI) {
 
   // --- Recall tool ----------------------------------------------------------
 
-  pi.registerTool({
+  pi.registerTool(stateRunTool({
     name: "hindsight_recall",
     label: "Recall Memory",
     description:
@@ -530,7 +531,7 @@ export default function (pi: ExtensionAPI) {
         details: { banks, resultCount: merged.length },
       };
     },
-  });
+  }));
 
   // --- Explicit memory store -------------------------------------------------
 

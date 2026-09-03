@@ -66,6 +66,7 @@ The package has 16 TypeScript source files and no tests. Reference counts below 
 | `validateStepResponse` | function | `extensions/skill-state/schemas.ts:93` | TypeBox validation returning error paths that name offending keys. |
 | `loadSpec` | function | `extensions/skill-state/workflow.ts:35` | Built-in spec or `--skill` file, ≤ 4 KB. |
 | `saveCheckpoint` / `listCheckpoints` | functions | `extensions/skill-state/checkpoints.ts` | Per-cwd durable checkpoint files under the Pi agent dir. |
+| `stateRunTool` / `runStateRunTool` | functions | `extensions/skill-state/tool-registry.ts` | globalThis registry of sibling read-only tools; vocabulary, validation and execution for the `tool` action. |
 | `openRunLog` | function | `extensions/skill-state/runlog.ts` | Per-run JSONL trace (prompts, replies, rejections, states, observations) next to the checkpoints; `tools/runlog.ts` reads it. |
 
 ## CONVENTIONS
@@ -73,6 +74,7 @@ The package has 16 TypeScript source files and no tests. Reference counts below 
 - Keep the default export a pi extension factory. Register tools/events through the provided `ExtensionAPI`; do not introduce a separate application entry point.
 - Runtime imports must resolve from pi's dependency tree (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai/compat`, `@earendil-works/pi-tui`, `typebox`) or Node built-ins. Plugins intentionally ship no `node_modules`.
 - Sibling imports omit the `.ts` extension (`from "./client"`); `allowImportingTsExtensions` is not enabled.
+- Read-only tools are registered as `pi.registerTool(stateRunTool({ ... }))` (`extensions/skill-state/tool-registry.ts`) so `/state-run` can call them; never wrap a tool that writes.
 - The installed `pi` binary may lag `node_modules` types (0.83.0 vs 0.84.2 at last check). Use APIs present in both; e.g. resolve auth with `ctx.modelRegistry.getApiKeyAndHeaders` and call `complete` from `@earendil-works/pi-ai/compat`, not `ctx.modelRegistry.complete`.
 - Use strict TypeScript with ES2022, ESNext, bundler resolution, and no emitted files. Match the existing direct string-concatenation style and typed TypeBox schemas when editing adjacent code.
 - External API clients use environment-selected base URLs, optional bearer tokens, `AbortSignal` cancellation/timeouts, and readable tool errors that preserve HTTP status in `details.status` where applicable.

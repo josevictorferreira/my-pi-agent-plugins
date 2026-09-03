@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { stateRunTool } from "../skill-state/tool-registry";
 
 const DEFAULT_API_URL = "https://velox.josevictor.me";
 
@@ -72,7 +73,7 @@ function errorResult(text: string, status?: number) {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerTool({
+  pi.registerTool(stateRunTool({
     name: "web_search",
     label: "Web Search",
     description:
@@ -152,9 +153,9 @@ export default function (pi: ExtensionAPI) {
         details: { provider: data.provider, resultCount: results.length, attempts: data.attempts },
       };
     },
-  });
+  }));
 
-  pi.registerTool({
+  pi.registerTool(stateRunTool({
     name: "web_fetch",
     label: "Web Fetch",
     description:
@@ -202,5 +203,5 @@ export default function (pi: ExtensionAPI) {
         details: { provider: data.provider, url: data.url, attempts: data.attempts, truncated },
       };
     },
-  });
+  }));
 }

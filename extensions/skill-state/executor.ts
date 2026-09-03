@@ -16,8 +16,18 @@ const SEARCH_MAX_LINE_CHARS = 300;
 const MAX_SEARCH_LINES = 80;
 const MAX_SEARCH_FILES = 40;
 
+export type ObservationKind = "ok" | "error" | "empty";
+
+/** Extension tools made available to a run (see tool-registry.ts). */
+export interface ToolRunner {
+  has(name: string): boolean;
+  run(name: string, params: Record<string, unknown>, signal: AbortSignal): Promise<string>;
+}
+
 export interface ExecutionResult {
   observation: string;
+  /** "error" when the action itself failed (bad path, no match, tool error); "empty" for a valid but empty result. */
+  kind: ObservationKind;
   /** Path read by read_file or matched by search_files (for inspectedFiles). */
   inspected?: string[];
   /** Path written by write_file / patch_file (for changedFiles). */
@@ -166,10 +176,26 @@ async function grepLines(cwd: string, pattern: string, glob: string | undefined,
     .map((l) => (l.startsWith("./") ? l.slice(2) : l));
 }
 
+// Documentation, plans and agent skill files mention every product concept and
+// crowd out code in search results. They rank last and never count as inspected.
+const DOC_PATH = /(^|\/)(\.agents|docs?|wiki|notes)\/|\.(md|markdown|rst|html?|adoc)$/i;
+const CODE_DIR = /^(app|lib|src|source|spec|specs|test|tests|__tests__|config|db|bin|cmd|internal|pkg|packages|extensions|server|client|api|core|domain)(\/|$)/;
+
+export function isDocPath(path: string): boolean {
+  return DOC_PATH.test(path);
+}
+
+/** 0 = source/test dirs, 1 = other code, 2 = documentation. */
+function searchRank(path: string): number {
+  if (isDocPath(path)) return 2;
+  return CODE_DIR.test(path) ? 0 : 1;
+}
+
 /**
  * Bounded search observation. Up to MAX_SEARCH_LINES matches are shown in
- * full. Above that, listing a random window of lines tells the model nothing,
- * so it gets a per-file match map and is asked to narrow the pattern.
+ * full, code before documentation. Above that, listing a random window of
+ * lines tells the model nothing, so it gets a per-file match map (code first,
+ * then by count) and is asked to narrow the pattern.
  */
 function formatSearch(lines: string[], pattern: string, glob: string | undefined): { text: string; shown: string[] } {
   const scope = "/" + pattern + "/" + (glob ? " in " + glob : "");
@@ -179,13 +205,15 @@ function formatSearch(lines: string[], pattern: string, glob: string | undefined
     const path = line.slice(0, line.indexOf(":"));
     byFile.set(path, (byFile.get(path) ?? 0) + 1);
   }
+  const pathOf = (l: string) => l.slice(0, l.indexOf(":"));
   if (lines.length <= MAX_SEARCH_LINES) {
+    const ordered = [...lines].sort((a, b) => searchRank(pathOf(a)) - searchRank(pathOf(b)));
     const text =
       lines.length + " matches in " + byFile.size + " files for " + scope + ":\n" +
-      lines.map((l) => (l.length > SEARCH_MAX_LINE_CHARS ? l.slice(0, SEARCH_MAX_LINE_CHARS) + " [truncated]" : l)).join("\n");
-    return { text, shown: [...byFile.keys()] };
+      ordered.map((l) => (l.length > SEARCH_MAX_LINE_CHARS ? l.slice(0, SEARCH_MAX_LINE_CHARS) + " [truncated]" : l)).join("\n");
+    return { text, shown: [...byFile.keys()].filter((p) => !isDocPath(p)) };
   }
-  const ranked = [...byFile.entries()].sort((a, b) => b[1] - a[1]);
+  const ranked = [...byFile.entries()].sort((a, b) => searchRank(a[0]) - searchRank(b[0]) || b[1] - a[1]);
   const top = ranked.slice(0, MAX_SEARCH_FILES);
   const text =
     lines.length + " matches in " + byFile.size + " files for " + scope + ". Too many to list; matches per file" +
@@ -265,18 +293,23 @@ async function patchFile(cwd: string, path: string, oldText: string, newText: st
 }
 
 /** Execute one action. Never throws: failures become error observations. */
-export async function execute(action: RepoAction, cwd: string, signal: AbortSignal): Promise<ExecutionResult> {
-  const header = "Result of " + action.type + ":\n";
+export async function execute(action: RepoAction, cwd: string, signal: AbortSignal, tools?: ToolRunner): Promise<ExecutionResult> {
+  const header = "Result of " + (action.type === "tool" ? "tool " + action.name : action.type) + ":\n";
   try {
     switch (action.type) {
       case "search_files": {
         const lines = await grepLines(cwd, action.pattern, action.glob, signal);
         const { text, shown } = formatSearch(lines, action.pattern, action.glob);
-        return { observation: header + boundOutput(text), inspected: shown };
+        return { observation: header + boundOutput(text), inspected: shown, kind: lines.length ? "ok" : "empty" };
       }
       case "read_file": {
         const out = await readFileWindow(cwd, action.path, action.offset, action.limit);
-        return { observation: header + out, inspected: [safePath(cwd, action.path).rel] };
+        return { observation: header + out, inspected: [safePath(cwd, action.path).rel], kind: out.includes(" is past the end.") ? "empty" : "ok" };
+      }
+      case "tool": {
+        if (!tools || !tools.has(action.name)) throw new Error("no such tool: " + action.name);
+        const out = await tools.run(action.name, action.params as Record<string, unknown>, signal);
+        return { observation: header + boundOutput(out), kind: out.trim() ? "ok" : "empty" };
       }
       case "write_file": {
         const { absolute, rel } = safePath(cwd, action.path);
@@ -285,11 +318,12 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
         return {
           observation: header + "Wrote " + rel + " (" + action.content.split("\n").length + " lines)",
           changed: rel,
+          kind: "ok",
         };
       }
       case "patch_file": {
         const out = await patchFile(cwd, action.path, action.oldText, action.newText);
-        return { observation: header + out, changed: safePath(cwd, action.path).rel };
+        return { observation: header + out, changed: safePath(cwd, action.path).rel, kind: "ok" };
       }
       case "exec_shell": {
         const timeoutMs = Math.min(action.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
@@ -306,6 +340,7 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
         const lastLine = result.output.trim().split("\n").pop() ?? "";
         return {
           observation: header + body,
+          kind: result.output.trim() ? "ok" : "empty",
           check: {
             command: action.command.slice(0, 120),
             code: result.timedOut ? 124 : result.code,
@@ -317,12 +352,15 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
         const paths = (action.paths ?? []).map((p) => safePath(cwd, p).rel);
         const command = ["git", "diff", "--", ...paths.map((p) => "'" + p.replace(/'/g, "'\\''") + "'")].join(" ");
         const result = await runShell(command, cwd, DEFAULT_TIMEOUT_MS, signal);
-        return { observation: header + (result.output.trim() ? boundOutput(result.output) : "No uncommitted changes.") };
+        return {
+          observation: header + (result.output.trim() ? boundOutput(result.output) : "No uncommitted changes."),
+          kind: result.output.trim() ? "ok" : "empty",
+        };
       }
       case "finish":
-        return { observation: header + "Run finished." };
+        return { observation: header + "Run finished.", kind: "ok" };
     }
   } catch (err) {
-    return { observation: header + "Error: " + ((err as Error).message ?? String(err)) };
+    return { observation: header + "Error: " + ((err as Error).message ?? String(err)), kind: "error" };
   }
 }

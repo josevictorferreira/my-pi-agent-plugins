@@ -1,5 +1,5 @@
-import { execute } from "./executor";
-import { lastFencedJson, render } from "./prompt";
+import { execute, type ObservationKind, type ToolRunner } from "./executor";
+import { lastFencedJson, reasoningText, render } from "./prompt";
 import { validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
 import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
 
@@ -38,6 +38,13 @@ export interface StepTelemetry {
   providerRetries: number;
   reReadCount: number;
   durationMs: number;
+  /** Whether the action itself succeeded and what kind of observation it produced. */
+  actionOk: boolean;
+  observationKind: ObservationKind;
+  /** Set for `tool` actions. */
+  toolName?: string;
+  /** Characters of reasoning before the JSON block in the accepted reply. */
+  reasoningChars: number;
 }
 
 export type RunStatus = "completed" | "failed" | "cancelled";
@@ -60,12 +67,15 @@ export interface Checkpoint {
   observation: string;
   totals: { input: number; output: number; cacheRead: number };
   reReadCount: number;
+  /** Set when the model itself ended the run with cannot_complete. */
+  outcome?: "cannot_complete";
 }
 
 export interface RunSummary {
   runId: string;
   objective: string;
   status: RunStatus;
+  maxSteps: number;
   /** Set when the model sent a finish action. */
   outcome?: "completed" | "cannot_complete";
   summary?: string;
@@ -104,6 +114,10 @@ export interface RunOptions {
   onEvent?: (event: RunEvent) => void;
   /** Model name, recorded in the run_start event only. */
   model?: string;
+  /** Extension tools the model may call with the `tool` action. */
+  tools?: ToolRunner & { vocabulary: string; validate: (name: string, params: unknown) => string[] };
+  /** Reject (once per step) a reply that has no reasoning before the JSON block. */
+  requireReasoning?: boolean;
 }
 
 async function initialObservation(cwd: string, signal: AbortSignal): Promise<string> {
@@ -166,6 +180,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       runId,
       objective,
       status,
+      maxSteps: options.maxSteps,
       steps,
       totals,
       avgPromptTokens: own ? Math.round(promptTokenSum / own) : 0,
@@ -179,7 +194,10 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       checkpoint:
         status === "completed"
           ? undefined
-          : { runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount },
+          : {
+              runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount,
+              outcome: extra.outcome === "cannot_complete" ? "cannot_complete" : undefined,
+            },
       ...extra,
     };
     emit({ type: "run_end", summary });
@@ -194,7 +212,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     let providerRetries = 0;
     const rejections: string[] = [];
     let errors: string[] | undefined;
-    let accepted: { response: StepResponse; next: SkillExecutionState } | undefined;
+    let accepted: { response: StepResponse; next: SkillExecutionState; reasoningChars: number } | undefined;
+    let reasoningAsked = false;
     let promptBytes = 0;
     let stateBytes = 0;
     let observationBytes = 0;
@@ -202,7 +221,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 
     // Rollback-retry: every attempt is a fresh (P, Σt, Ot [+ errors]) prompt.
     while (!accepted) {
-      const prompt = render(spec, state, observation, options.maxSteps, errors);
+      const prompt = render(spec, state, observation, options.maxSteps, errors, options.tools?.vocabulary);
       promptBytes = Buffer.byteLength(prompt);
       stateBytes = Buffer.byteLength(serializeState(state));
       observationBytes = Buffer.byteLength(observation);
@@ -231,13 +250,23 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 
       const parsed = lastFencedJson(reply.text);
       errors = parsed.ok ? validateStepResponse(parsed.value) : [parsed.error];
+      const reasoning = reasoningText(reply.text);
+      if (!errors.length && options.requireReasoning && !reasoning && !reasoningAsked) {
+        reasoningAsked = true;
+        errors = ["no_reasoning: write your step-by-step reasoning before the ```json block, then the block"];
+      }
       if (!errors.length && parsed.ok) {
         const response = parsed.value as StepResponse;
-        const merged = merge(state, response.state_patch, { maxSteps: options.maxSteps });
-        if (!merged.ok) errors = merged.errors;
-        else {
-          errors = actionErrors(merged.state, response.action.type);
-          if (!errors.length) accepted = { response, next: merged.state };
+        if (response.action.type === "tool") {
+          errors = options.tools ? options.tools.validate(response.action.name, response.action.params) : ["/action/type: no extension tools are available in this run"];
+        }
+        if (!errors.length) {
+          const merged = merge(state, response.state_patch, { maxSteps: options.maxSteps });
+          if (!merged.ok) errors = merged.errors;
+          else {
+            errors = actionErrors(merged.state, response.action.type);
+            if (!errors.length) accepted = { response, next: merged.state, reasoningChars: reasoning.length };
+          }
         }
       }
       emit({ type: "attempt", step, attempt: attemptNo, prompt, reply: reply.text, usage: reply.usage, errors: errors ?? [], durationMs: Date.now() - attemptStarted });
@@ -252,8 +281,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       }
     }
 
-    // Commit Σt+1, then execute at.
-    if (accepted.next.status !== state.status) accepted.next.statusSince = step;
+    // Commit Σt+1 (statusSince / readsSinceWrite were set by merge), then execute at.
     state = accepted.next;
     state.step = step;
     steps = step;
@@ -266,7 +294,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     minPromptBytes = Math.min(minPromptBytes, promptBytes);
     maxPromptBytes = Math.max(maxPromptBytes, promptBytes);
 
-    const result = await execute(action, cwd, signal);
+    const result = await execute(action, cwd, signal, options.tools);
     recordAction(state, action.type);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
     if (action.type === "read_file" || action.type === "search_files") {
@@ -301,6 +329,10 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       providerRetries,
       reReadCount,
       durationMs: Date.now() - started,
+      actionOk: result.kind !== "error",
+      observationKind: result.kind,
+      toolName: action.type === "tool" ? action.name : undefined,
+      reasoningChars: accepted.reasoningChars,
     };
     emit({ type: "step", step, action, statePatch: accepted.response.state_patch, state, observation, telemetry });
     options.onStep(telemetry, state);
@@ -312,5 +344,5 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       });
     }
   }
-  return finish("failed", { error: "reached max steps (" + options.maxSteps + ") without finish" });
+  return finish("failed", { error: "reached max steps (" + options.maxSteps + ") without finish; remaining plan: " + (state.plan.join("; ") || "none") });
 }

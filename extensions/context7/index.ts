@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { stateRunTool } from "../skill-state/tool-registry";
 
 const DEFAULT_API_URL = "https://context7.com/api";
 
@@ -88,7 +89,7 @@ function resultFacts(result: SearchResult): string {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerTool({
+  pi.registerTool(stateRunTool({
     name: "context7_resolve_library_id",
     label: "Resolve Library ID",
     description:
@@ -153,9 +154,9 @@ export default function (pi: ExtensionAPI) {
         details: { resultCount: results.length },
       };
     },
-  });
+  }));
 
-  pi.registerTool({
+  pi.registerTool(stateRunTool({
     name: "context7_query_docs",
     label: "Query Library Docs",
     description:
@@ -223,5 +224,5 @@ export default function (pi: ExtensionAPI) {
         details: { libraryId, topic: params.topic },
       };
     },
-  });
+  }));
 }

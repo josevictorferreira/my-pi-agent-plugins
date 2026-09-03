@@ -5,23 +5,21 @@ import { serializeState } from "./state";
 // system prompt, reasoning first, then one fenced JSON block.
 
 const ACTION_VOCABULARY =
-  '- {"type":"search_files","pattern":"<regex>","glob":"<optional file glob>"}  grep -rn under the repo root\n' +
-  '- {"type":"read_file","path":"<relative>","offset":<line, 1-based>,"limit":<lines>}  read a file window\n' +
-  '- {"type":"write_file","path":"<relative>","content":"<full text>"}  create or overwrite a file\n' +
-  '- {"type":"patch_file","path":"<relative>","oldText":"<exact unique text>","newText":"<replacement>"}  replace one occurrence\n' +
-  '- {"type":"exec_shell","command":"<sh -c command>","timeoutMs":<optional, max 120000>}  run a command in the repo root\n' +
-  '- {"type":"git_diff","paths":["<optional relative paths>"]}  show uncommitted changes\n' +
-  '- {"type":"finish","outcome":"completed"|"cannot_complete","summary":"<what was done and what remains>"}  end the run';
+  '- {"type":"search_files","pattern":"<regex>","glob":"<optional glob>"}  code-first grep, ignored files excluded\n' +
+  '- {"type":"read_file","path":"<relative>","offset":<line>,"limit":<lines>}\n' +
+  '- {"type":"write_file","path":"<relative>","content":"<full text>"}\n' +
+  '- {"type":"patch_file","path":"<relative>","oldText":"<exact unique text>","newText":"<replacement>"}\n' +
+  '- {"type":"exec_shell","command":"<sh -c>","timeoutMs":<optional, max 120000>}\n' +
+  '- {"type":"git_diff","paths":["<optional>"]}\n' +
+  '- {"type":"finish","outcome":"completed"|"cannot_complete","summary":"<what changed, what remains>"}';
 
 const STATE_RULES =
   "State update rules:\n" +
-  '- "state_patch" is merged into the state. Only include keys you change.\n' +
-  "- Object fields (facts, hypotheses): keys merge; set a key to null to delete it. Values are short free text.\n" +
-  "- List fields (plan, blockers): the list you send replaces the old list entirely.\n" +
-  "- Never send: version, step, statusSince, readsSinceWrite, objective, inspectedFiles, changedFiles, checks. They are runtime-owned.\n" +
-  "- Before leaving a file, write what you learned into facts. You will not see this observation again.\n" +
-  "- Limits: facts ≤ 24 keys (values ≤ 300 chars), hypotheses ≤ 12 keys (values ≤ 200 chars), plan and blockers ≤ 15 items, whole state ≤ 6 KB.\n" +
-  "- Phases are enforced: after a third of the step budget (at most 30 steps), status must leave \"inspecting\"; \"planning\" lasts at most 2 steps and requires a non-empty plan, then status must be \"editing\" (entered with a plan; remove items as you finish them); in \"editing\", after 3 read-only actions without a write the next action must be write_file, patch_file or finish; \"testing\" requires a changed file. A reply that violates this is rejected and you are asked again.";
+  '- "state_patch" is merged: send only keys you change. facts/hypotheses merge by key, null deletes; plan/blockers are replaced whole.\n' +
+  "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, readsSinceWrite, objective, inspectedFiles, changedFiles, checks.\n" +
+  "- Before leaving a file, write what you learned into facts; you will not see this observation again.\n" +
+  "- Limits: facts ≤ 40 (values ≤ 300 chars), hypotheses ≤ 12 (≤ 200 chars), plan/blockers ≤ 15 items, state ≤ 12 KB.\n" +
+  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 read-only actions between writes; testing needs a changed file. Violations are rejected and you are asked again.";
 
 const RESPONSE_FORMAT =
   "Provide your response with:\n" +
@@ -36,6 +34,7 @@ export function render(
   observation: string,
   maxSteps: number,
   rejectionErrors?: string[],
+  toolVocabulary?: string,
 ): string {
   let prompt =
     "Instructions:\n" +
@@ -43,6 +42,7 @@ export function render(
     "\n\n" +
     "Repository action vocabulary (JSON, exactly one per step):\n" +
     ACTION_VOCABULARY +
+    (toolVocabulary ? "\n" + toolVocabulary : "") +
     "\n\n" +
     STATE_RULES +
     "\n\n" +
@@ -78,4 +78,11 @@ export function lastFencedJson(text: string): ParsedReply {
       error: (last === undefined ? "no_json_block: " : "invalid_json: ") + String((err as Error).message),
     };
   }
+}
+
+/** Text the model wrote before the last fenced JSON block (its reasoning), trimmed. */
+export function reasoningText(text: string): string {
+  const idx = text.lastIndexOf("```json");
+  const before = idx === -1 ? "" : text.slice(0, idx);
+  return before.trim();
 }

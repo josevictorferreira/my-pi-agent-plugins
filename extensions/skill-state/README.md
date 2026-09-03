@@ -9,7 +9,7 @@ Each step the model sees exactly three things and nothing else:
 | Symbol | What it is | Bound |
 | --- | --- | --- |
 | P | frozen skill spec (built-in SE workflow or a `--skill` markdown file) | ≤ 4 KB |
-| Σt | small JSON execution state owned by the runtime | ≤ 6 KB |
+| Σt | small JSON execution state owned by the runtime | ≤ 12 KB |
 | Ot | the latest observation only | ≤ 200 lines / 8 KB |
 
 It replies with free-form reasoning followed by one fenced JSON block holding a
@@ -21,8 +21,8 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 ## Commands
 
 ```
-/state-run [--skill <path>] [--max-steps N] <objective>
-/state-resume [--list] [--run <runId>] [--max-steps N] [note for the model]
+/state-run [--skill <path>] [--max-steps N] [--reasoning required|optional] [--no-tools] <objective>
+/state-resume [--list] [--run <runId>] [--max-steps N] [--reasoning required] [--no-tools] [note for the model]
 /state-log [runId]
 /state-cancel
 ```
@@ -38,12 +38,15 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 `<working-directory>` is the Pi cwd with every non-alphanumeric character replaced by `-`, the same scheme Pi uses for `sessions/`. `~/.pi/agent` moves with `PI_CODING_AGENT_DIR`. Inside Pi, `/state-log` prints the directory and lists the runs in it; `/state-log <runId>` prints one file's path. Every run summary, result message and failure notice also names its log path.
 
 - `--skill <path>`: markdown file (≤ 4 KB) used verbatim as the spec `P`. Default is the built-in inspect → plan → edit → test → repair workflow in `workflow.ts`.
+- `--reasoning required`: reject, once per step, a reply that has no reasoning text before the JSON block. Default `optional`: the paper's format asks for reasoning first, but the models tested skip it and still complete tasks, so this exists to measure the difference, not to enforce a belief. Telemetry records `reasoningChars` per step either way.
+- `--no-tools`: hide the extension tools (below) from the run.
 - `--max-steps N`: step cap, default 250. Per-step cost is flat, so a large default costs nothing when the run finishes early; the phase rules below keep the model from spending it on inspection.
 - One run at a time; a second `/state-run` while one is active is refused.
 - Every prompt tells the model the current step and the cap. **Phases and progress are enforced by the runtime, not just requested by the spec.** Rejected replies get the rollback-retry treatment, so the loop forces the transition the same way it forces schema compliance (prose rules alone were not followed by the models tested; validation errors were, on the first retry, every time):
   - after a third of the budget, and never later than step 30, a patch that leaves `status` at `inspecting` is rejected;
   - `planning` requires a non-empty `plan` and lasts at most 2 steps, then `status` must be `editing`, entered with a plan (items are removed as they are done, so the plan may be empty later);
-  - in `editing`, after 3 read-only actions (`read_file`, `search_files`, `exec_shell`, `git_diff`) without a write, the next action must be `write_file`, `patch_file` or `finish`;
+  - every plan item must name a file (a path or `name.ext`) or a command to run; "search for X" is inspection, not a plan;
+  - in `editing`, after 3 read-only actions (`read_file`, `search_files`, `exec_shell`, `git_diff`, `tool`) without a write, the next action must be `write_file`, `patch_file` or `finish`; the counter starts at zero when `editing` is entered;
   - `testing` requires at least one changed file.
   The runtime tracks this in two runtime-owned state fields, `statusSince` and `readsSinceWrite`, which the model sees but cannot patch.
 - **Budget guidance.** Single-file fixes finish in 5 to 15 steps. A multi-file feature in a real application has needed 60 to 100. The default of 250 leaves room for repair cycles; lower it with `--max-steps` when you want a hard stop.
@@ -51,7 +54,7 @@ prompt size is independent of the step count and cumulative tokens grow linearly
 - An identical `read_file` or `search_files` repeated with no intervening write is still executed, but its observation is prefixed with a note saying it already ran at step *k* and nothing changed. Writes clear that memory.
 - The run uses the session's current model with no provider thinking (reasoning is textual, as in the paper's Appendix A.4). No sampling temperature is sent by default because some upstreams reject the parameter; set `SKILL_STATE_TEMPERATURE=0` to reproduce the paper's decoding on a model that accepts it.
 - `/state-cancel` or session shutdown aborts the run and kills any running child process.
-- **Recovery.** Σ is the run's entire memory, so a run that fails or is cancelled is checkpointed (spec, state, last observation, token totals) both as a `skill-state-checkpoint` session entry and as a file under `~/.pi/agent/skill-state/<working-directory>/<runId>.json`. The file store is independent of Pi's session persistence, so a run can be resumed from any later Pi session in the same directory: `/state-resume --list` shows the checkpoints for the directory, `/state-resume --run <runId>` picks one, and plain `/state-resume` takes the run from this process, then this session, then the newest file. A run that completes deletes its file. `/state-resume` continues from that state with whatever model is currently selected: switch with `/model` first if the previous one is misbehaving. Pass a larger `--max-steps` when the run stopped on the step cap. Any other text after the command is delivered to the model as an operator note in the first observation of the resumed run, which is how you answer a `cannot_complete` blocker (for example: `/state-resume --max-steps 60 fail_fast does not exist yet; add it to the workflow config and proceed to planning`). Resuming after `cannot_complete` with no note and no new budget reproduces the same conclusion. This is the paper's "zero-step state recovery" (Table 3) used operationally.
+- **Recovery.** Σ is the run's entire memory, so a run that fails or is cancelled is checkpointed (spec, state, last observation, token totals) both as a `skill-state-checkpoint` session entry and as a file under `~/.pi/agent/skill-state/<working-directory>/<runId>.json`. The file store is independent of Pi's session persistence, so a run can be resumed from any later Pi session in the same directory: `/state-resume --list` shows the checkpoints for the directory, `/state-resume --run <runId>` picks one, and plain `/state-resume` takes the run from this process, then this session, then the newest file. A run that completes deletes its file. `/state-resume` continues from that state with whatever model is currently selected: switch with `/model` first if the previous one is misbehaving. Pass a larger `--max-steps` when the run stopped on the step cap. Any other text after the command is delivered to the model as an operator note in the first observation of the resumed run, which is how you answer a `cannot_complete` blocker (for example: `/state-resume --max-steps 60 fail_fast does not exist yet; add it to the workflow config and proceed to planning`). Resuming a `cannot_complete` checkpoint with no note and no larger budget is refused, because the same state produces the same answer. This is the paper's "zero-step state recovery" (Table 3) used operationally.
 - **Provider errors.** A failed model call is retried up to 4 times with 2 s / 8 s / 20 s backoff (proxies with cold starts have been observed to need 10+ s). If it still fails, the run stops and is checkpointed rather than losing its state.
 - Each `skill-state-step` entry records why rejected replies were rejected (`rejections`) and how many provider retries happened, so a run with many retries can be diagnosed from the transcript (expand the entry).
 
@@ -68,7 +71,12 @@ produce an error observation, not a crash.
 | `patch_file {path, oldText, newText}` | replace exactly one occurrence; 0 or 2+ matches is an error |
 | `exec_shell {command, timeoutMs?}` | `sh -c` in the repo root in its own process group; default 30 s, max 120 s. Timeout and cancel kill the whole group. The step settles when the shell exits, not when its stdio closes, so a daemon started by the command (a database server, a dev server) cannot hang the run; the observation says the process was left running |
 | `git_diff {paths?}` | uncommitted diff |
+| `tool {name, params}` | one of the read-only tools other extensions in this package share with state-run (see below); params are validated against the tool's own schema |
 | `finish {outcome, summary}` | end the run with `completed` or `cannot_complete` |
+
+### Extension tools
+
+Pi lets an extension list other extensions' tools but not run them, so the sibling extensions in this package hand their read-only tool definitions to `tool-registry.ts` by wrapping the definition: `pi.registerTool(stateRunTool({ ... }))`. The registry lives on `globalThis`, because Pi may load each extension through its own module cache. Currently shared: `codegraph_explore`, `codegraph_node`, `codegraph_query` and `codegraph_search` (when CodeGraph registers them), `context7_resolve_library_id`, `context7_query_docs`, `lsp`, `web_search`, `web_fetch`, `hindsight_recall`. Writing tools (`hindsight_retain`) are deliberately not shared: edits stay with `patch_file`/`write_file` so change tracking and the phase policy keep working. The vocabulary section in the prompt is generated from the registry (name, first sentence of the description, parameter names and types), about 1 KB for the full set. Tools from third-party packages are not reachable.
 
 ## State schema
 
@@ -80,7 +88,7 @@ model-owned:   status, plan[], hypotheses{} (short free text), facts{}, blockers
 Merge semantics (stated in the prompt): `facts` and `hypotheses` merge by key
 and `null` deletes; `plan` and `blockers` are replaced whole; patching a
 runtime-owned key is a validation error that names the key. Bounds after merge:
-24 facts (values ≤ 300 chars), 12 hypotheses (values ≤ 200 chars), 15 plan/blocker items, 6 KB total, plus the phase rules above.
+40 facts (values ≤ 300 chars), 12 hypotheses (values ≤ 200 chars), 15 plan/blocker items, 12 KB total, plus the phase rules above. The paper's 6 KB suited its shelf and CTF schemas; on source code the state grew about 140 bytes per step and hit 6 KB around step 40.
 An invalid or over-bound reply is rejected, the state is left untouched, and the
 same `(P, Σt, Ot)` prompt is re-sent with the error list appended, at most twice
 (rollback-retry, paper §7). A third rejection fails the run.
@@ -94,7 +102,7 @@ Every run writes a JSONL trace to `~/.pi/agent/skill-state/<working-directory>/l
 | `run_start` | run id, objective, budget, model, spec, cwd, `resumedFrom` |
 | `attempt` | one per model call that returned: full prompt, raw reply (with the discarded reasoning), usage, validation/merge errors (empty when accepted), duration |
 | `provider_error` | one per failed model call: attempt number, error, duration |
-| `step` | committed step: action, `state_patch`, state after merge, observation, telemetry |
+| `step` | committed step: action, `state_patch`, state after merge, observation, telemetry (including `actionOk`, `observationKind`, `toolName`, `reasoningChars`) |
 | `run_end` | the run summary |
 
 `/state-log` inside Pi shows the folder and the runs. Inspect a run with the bundled tool (`bun`, no build, run from this repo):

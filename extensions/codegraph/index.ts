@@ -9,6 +9,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { stateRunTool } from "../skill-state/tool-registry";
 
 const execFileAsync = promisify(execFile);
 
@@ -156,7 +157,7 @@ export default function (pi: ExtensionAPI) {
     const enabled = enabledTools();
 
     if (enabled.has("explore")) {
-      pi.registerTool({
+      pi.registerTool(stateRunTool({
         name: "codegraph_explore",
         label: "Explore Code",
         description:
@@ -200,11 +201,11 @@ export default function (pi: ExtensionAPI) {
           // explore emits clean markdown, already formatted for a model.
           return textResult(data!, { query: params.query, projectPath: params.project_path });
         },
-      });
+      }));
     }
 
     if (enabled.has("node")) {
-      pi.registerTool({
+      pi.registerTool(stateRunTool({
         name: "codegraph_node",
         label: "Read Symbol",
         description:
@@ -253,11 +254,11 @@ export default function (pi: ExtensionAPI) {
           // node emits clean markdown, same as explore.
           return textResult(data!, { name: params.name, projectPath: params.project_path });
         },
-      });
+      }));
     }
 
     if (enabled.has("query")) {
-      pi.registerTool({
+      pi.registerTool(stateRunTool({
         name: "codegraph_query",
         label: "Search Symbols",
         description:
@@ -283,7 +284,7 @@ export default function (pi: ExtensionAPI) {
           if (error) return errorResult(error);
           return textResult(stripAnsi(data!), { search: params.search });
         },
-      });
+      }));
     }
 
     for (const direction of ["callers", "callees"] as const) {
@@ -324,7 +325,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (enabled.has("impact")) {
-      pi.registerTool({
+      pi.registerTool(stateRunTool({
         name: "codegraph_impact",
         label: "Analyze Impact",
         description:
@@ -349,7 +350,7 @@ export default function (pi: ExtensionAPI) {
           if (error) return errorResult(error);
           return textResult(stripAnsi(data!), { symbol: params.symbol });
         },
-      });
+      }));
     }
 
     if (enabled.has("files")) {

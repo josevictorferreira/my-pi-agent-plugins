@@ -117,7 +117,7 @@ if (start) {
   console.log("run " + start.runId + (start.model ? "  model " + start.model : "") + "  maxSteps " + start.maxSteps + (start.resumedFrom !== undefined ? "  resumed from step " + start.resumedFrom : ""));
   console.log("objective: " + clip(start.objective, 200) + "\n");
 }
-console.log(pad("step", 5) + pad("status", 11) + pad("action", 13) + rpad("promptB", 8) + rpad("stateB", 7) + rpad("obsB", 6) + rpad("in", 6) + rpad("out", 5) + rpad("rej", 4) + rpad("prov", 5) + rpad("rr", 3) + rpad("ms", 7) + "  detail");
+console.log(pad("step", 5) + pad("status", 11) + pad("action", 13) + rpad("promptB", 8) + rpad("stateB", 7) + rpad("obsB", 6) + rpad("in", 6) + rpad("out", 5) + rpad("rej", 4) + rpad("prov", 5) + rpad("rr", 3) + rpad("ms", 7) + "   detail   (! = action error, - = empty result)");
 for (const e of events) {
   if (e.type !== "step") continue;
   const t = e.telemetry;
@@ -128,10 +128,12 @@ for (const e of events) {
     : a.type === "exec_shell" ? clip(a.command, 60)
     : a.type === "patch_file" || a.type === "write_file" ? a.path
     : a.type === "finish" ? a.outcome + ": " + clip(a.summary, 60)
+    : a.type === "tool" ? a.name + " " + clip(JSON.stringify(a.params), 50)
     : "";
+  const mark = t.observationKind === "error" ? "!" : t.observationKind === "empty" ? "-" : " ";
   console.log(
     pad(t.step, 5) + pad(t.status, 11) + pad(a.type, 13) + rpad(t.promptBytes, 8) + rpad(t.stateBytes, 7) + rpad(t.observationBytes, 6) +
-      rpad(t.input, 6) + rpad(t.output, 5) + rpad(t.retries, 4) + rpad(t.providerRetries, 5) + rpad(t.reReadCount, 3) + rpad(t.durationMs, 7) + "  " + detail,
+      rpad(t.input, 6) + rpad(t.output, 5) + rpad(t.retries, 4) + rpad(t.providerRetries, 5) + rpad(t.reReadCount, 3) + rpad(t.durationMs, 7) + " " + mark + " " + detail,
   );
 }
 const ends = events.filter((e) => e.type === "run_end");

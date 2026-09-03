@@ -2,8 +2,11 @@ import type { SkillExecutionState, StatePatch } from "./schemas";
 
 // Bounds enforced after merge (plan §5.2). Exceeding any of them fails the
 // patch and leaves Σt untouched (paper §7 rollback-retry).
-export const MAX_STATE_BYTES = 6 * 1024;
-const MAX_FACTS = 24;
+// 12 KB / 40 facts: the paper's 6 KB suited shelf and CTF tasks; on source
+// code the state grew ~140 B per step and hit 6 KB around step 40, forcing
+// fact deletion (the "premature overwrite" failure). Still O(1) per step.
+export const MAX_STATE_BYTES = 12 * 1024;
+const MAX_FACTS = 40;
 const MAX_FACT_KEY_CHARS = 64;
 const MAX_FACT_VALUE_CHARS = 300;
 const MAX_HYPOTHESES = 12;
@@ -132,10 +135,27 @@ function phaseErrors(prev: SkillExecutionState, next: SkillExecutionState, patch
   if (patch.status === "testing" && prev.status !== "testing" && next.changedFiles.length === 0) {
     errors.push('/status: "testing" requires at least one changed file; nothing has been edited yet. Stay in "editing" and apply the first plan item.');
   }
+  if (patch.plan) {
+    patch.plan.forEach((item, i) => {
+      if (!isConcretePlanItem(item)) {
+        errors.push("/plan/" + i + ": name the file to change (a path) or the command to run; \"" + item.slice(0, 60) + "\" is neither");
+      }
+    });
+  }
   return errors;
 }
 
-const READ_ONLY_ACTIONS = new Set(["read_file", "search_files", "exec_shell", "git_diff"]);
+// A plan item is concrete when it names a path (contains "/" or file.ext) or a
+// command to run. "Search for X" or "Investigate Y" is more inspection, not a plan.
+const PATH_LIKE = /(^|[\s"'`(])[\w@.~-]*\/[\w@./~-]+|\b[\w-]+\.[a-z][a-z0-9]{0,5}\b/i;
+const LEADING_VERB = /^(run|execute|test|verify|check|exec_shell)\b/i;
+const COMMAND_TOKEN = /\b(exec_shell|bundle|npm|bun|pnpm|yarn|npx|rspec|pytest|jest|vitest|cargo|go test|make|rails|rake|git|mix|dotnet|mvn|gradle|tsc|eslint|rubocop)\b/i;
+export function isConcretePlanItem(item: string): boolean {
+  const t = item.trim();
+  return PATH_LIKE.test(t) || LEADING_VERB.test(t) || COMMAND_TOKEN.test(t) || t.includes("`");
+}
+
+const READ_ONLY_ACTIONS = new Set(["read_file", "search_files", "exec_shell", "git_diff", "tool"]);
 const WRITE_ACTIONS = new Set(["write_file", "patch_file"]);
 
 /**
@@ -161,6 +181,14 @@ export function recordAction(state: SkillExecutionState, actionType: string): vo
 /** Atomic merge: validate → clone → merge → bound-check → commit or reject. */
 export function merge(state: SkillExecutionState, patch: StatePatch, policy?: PhasePolicy): MergeResult {
   const next = applyPatch(state, patch);
+  if (next.status !== state.status) {
+    // Phase bookkeeping is runtime-owned and must be in place before the
+    // policies below look at it: the step being decided is state.step + 1, and
+    // the read streak limit is "between edits while editing", so inspection
+    // reads do not count.
+    next.statusSince = state.step + 1;
+    if (next.status === "editing") next.readsSinceWrite = 0;
+  }
   const errors = boundErrors(next);
   if (policy) errors.push(...phaseErrors(state, next, patch, policy));
   return errors.length ? { ok: false, errors } : { ok: true, state: next };
