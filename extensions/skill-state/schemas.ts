@@ -14,8 +14,10 @@ export interface SkillExecutionState {
   step: number;
   /** Step at which `status` last changed (phase budgets are measured from here). */
   statusSince: number;
-  /** Read-only actions taken since the last write_file/patch_file. */
+  /** Actions taken since the last write that changed a file (failed writes count). */
   readsSinceWrite: number;
+  /** Step at which a file last actually changed; 0 when nothing has changed yet. */
+  lastWriteStep: number;
   objective: string;
   inspectedFiles: string[];
   changedFiles: string[];

@@ -1,8 +1,12 @@
 import type { SkillExecutionState } from "./schemas";
 import { serializeState } from "./state";
 
-// Prompt shape follows the paper's Appendix A.4: a single user message, no
-// system prompt, reasoning first, then one fenced JSON block.
+// Prompt shape follows the paper's Appendix A.4: reasoning first, then one
+// fenced JSON block. The paper sends everything as one user message; here the
+// byte-identical part (spec, action vocabulary, state rules) is sent as the
+// system prompt instead, because that is where pi-ai puts the provider's
+// prompt-cache marker. Over 4 KB of every prompt was identical and `cacheRead`
+// was 0 for a whole 372-call run (improvements_3 §11).
 
 const ACTION_VOCABULARY =
   '- {"type":"search_files","pattern":"<regex>","glob":"<optional glob>"}  code-first grep, ignored files excluded\n' +
@@ -16,10 +20,10 @@ const ACTION_VOCABULARY =
 const STATE_RULES =
   "State update rules:\n" +
   '- "state_patch" is merged: send only keys you change. facts/hypotheses merge by key, null deletes; plan/blockers are replaced whole.\n' +
-  "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, readsSinceWrite, objective, inspectedFiles, changedFiles, checks.\n" +
+  "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, readsSinceWrite, lastWriteStep, objective, inspectedFiles, changedFiles, checks.\n" +
   "- Before leaving a file, write what you learned into facts; you will not see this observation again.\n" +
-  "- Limits: facts ≤ 40 (values ≤ 300 chars; longer values are cut and you are told), hypotheses ≤ 12 (≤ 200 chars, same), plan/blockers ≤ 15 items, state ≤ 12 KB. One idea per key; split long notes across keys.\n" +
-  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 read-only actions between writes; testing needs a changed file. Violations are rejected and you are asked again.";
+  "- Limits: facts ≤ 40 (values ≤ 600 chars; a longer value is cut, marked \" [CUT]\" and is no longer exact text), hypotheses ≤ 12 (≤ 200 chars, same), plan/blockers ≤ 15 items, state ≤ 12 KB. One idea per key; split long notes across keys.\n" +
+  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 actions that change nothing between writes (a rejected patch is one of them); editing and repairing end after 12 steps without a file change; testing needs a changed file. Violations are rejected and you are asked again.";
 
 const RESPONSE_FORMAT =
   "Provide your response with:\n" +
@@ -28,6 +32,12 @@ const RESPONSE_FORMAT =
   "   The JSON block MUST have exactly these two keys:\n" +
   '   { "state_patch": { ... }, "action": { ... } }';
 
+/** The stable half is cacheable and sent once as the system prompt; the varying half is the user message. */
+export interface RenderedPrompt {
+  system: string;
+  user: string;
+}
+
 export function render(
   spec: string,
   state: SkillExecutionState,
@@ -35,8 +45,8 @@ export function render(
   maxSteps: number,
   rejectionErrors?: string[],
   toolVocabulary?: string,
-): string {
-  let prompt =
+): RenderedPrompt {
+  const system =
     "Instructions:\n" +
     spec.trim() +
     "\n\n" +
@@ -44,8 +54,8 @@ export function render(
     ACTION_VOCABULARY +
     (toolVocabulary ? "\n" + toolVocabulary : "") +
     "\n\n" +
-    STATE_RULES +
-    "\n\n" +
+    STATE_RULES;
+  let user =
     "Skill Execution State:\n```json\n" +
     serializeState(state) +
     "\n```\n\n" +
@@ -53,12 +63,12 @@ export function render(
     observation +
     "\n\n";
   if (rejectionErrors && rejectionErrors.length) {
-    prompt +=
+    user +=
       "Previous response was rejected (state unchanged). Fix these and answer again:\n" +
       rejectionErrors.map((e) => "- " + e).join("\n") +
       "\n\n";
   }
-  return prompt + RESPONSE_FORMAT;
+  return { system, user: user + RESPONSE_FORMAT };
 }
 
 /** `start` is where the JSON begins in the reply; the text before it is the reasoning. */

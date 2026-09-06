@@ -26,17 +26,22 @@ interface ParsedArgs {
   skill?: string;
   maxSteps: number;
   requireReasoning: boolean;
-  noTools: boolean;
+  tools: boolean;
 }
 
-/** `/state-run [--skill <path>] [--max-steps N] [--reasoning required|optional] [--no-tools] <objective>` */
+/**
+ * `/state-run [--skill <path>] [--max-steps N] [--reasoning required|optional] [--tools] <objective>`
+ *
+ * Extension tools are opt-in: their vocabulary is 1.6 KB of every prompt and a
+ * 372-call run used them zero times (improvements_3 §9).
+ */
 export function parseArgs(raw: string): ParsedArgs {
   const tokens = raw.trim().split(/\s+/).filter(Boolean);
   const rest: string[] = [];
   let skill: string | undefined;
   let maxSteps = DEFAULT_MAX_STEPS;
   let requireReasoning = false;
-  let noTools = false;
+  let tools = false;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     if (token === "--skill" && tokens[i + 1]) skill = tokens[++i];
@@ -48,12 +53,12 @@ export function parseArgs(raw: string): ParsedArgs {
       const v = tokens[++i];
       if (v !== "required" && v !== "optional") throw new Error("--reasoning must be required or optional");
       requireReasoning = v === "required";
-    } else if (token === "--no-tools") noTools = true;
+    } else if (token === "--tools") tools = true;
     else rest.push(token);
   }
   // An objective typed in quotes would otherwise carry them into every prompt.
   const objective = rest.join(" ").replace(/^["'“]([\s\S]*)["'”]$/, "$1").trim();
-  return { objective, skill, maxSteps, requireReasoning, noTools };
+  return { objective, skill, maxSteps, requireReasoning, tools };
 }
 
 /** Extension tools shared through tool-registry.ts, as the runner expects them. */
@@ -78,8 +83,13 @@ function toolRunner(ctx: ExtensionCommandContext): RunOptions["tools"] {
  * proxy nothing is sent and the model's default applies (glm-5-3 via Velox spent
  * about five of every six output tokens on hidden reasoning). `usage.reasoning`
  * records it when the provider reports it.
+ *
+ * The spec, action vocabulary and state rules go in the system prompt and the
+ * run id is the cache session key, so the 4 KB that never change between steps
+ * can be served from the provider's prompt cache (`cacheRead` was 0 for every
+ * one of a run's 372 calls).
  */
-async function makeComplete(ctx: ExtensionCommandContext): Promise<CompleteFn> {
+async function makeComplete(ctx: ExtensionCommandContext, runId: string): Promise<CompleteFn> {
   const model = ctx.model;
   if (!model) throw new Error("no model selected");
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -89,8 +99,8 @@ async function makeComplete(ctx: ExtensionCommandContext): Promise<CompleteFn> {
   return async (prompt, signal) => {
     const reply = await complete(
       target,
-      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-      { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal, temperature },
+      { systemPrompt: prompt.system, messages: [{ role: "user", content: prompt.user, timestamp: Date.now() }] },
+      { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal, temperature, cacheRetention: "long", sessionId: runId },
     );
     if (reply.stopReason === "error" || reply.stopReason === "aborted") {
       throw new Error(reply.errorMessage || reply.stopReason);
@@ -197,7 +207,7 @@ export default function (pi: ExtensionAPI) {
   async function launch(ctx: ExtensionCommandContext, options: Omit<RunOptions, "cwd" | "signal" | "complete" | "onStep" | "onEvent" | "model">) {
     let complete: CompleteFn;
     try {
-      complete = await makeComplete(ctx);
+      complete = await makeComplete(ctx, options.runId);
     } catch (err) {
       ctx.ui.notify(String((err as Error).message ?? err), "error");
       return;
@@ -283,7 +293,7 @@ export default function (pi: ExtensionAPI) {
         spec,
         maxSteps: parsed.maxSteps,
         requireReasoning: parsed.requireReasoning,
-        tools: parsed.noTools ? undefined : toolRunner(ctx),
+        tools: parsed.tools ? toolRunner(ctx) : undefined,
       });
     },
   });
@@ -291,7 +301,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("state-resume", {
     description:
       "Continue a failed or cancelled /state-run from its checkpoint with the current model: " +
-      "/state-resume [--list] [--run <runId>] [--max-steps N] [--reasoning required] [--no-tools] [note for the model]",
+      "/state-resume [--list] [--run <runId>] [--max-steps N] [--reasoning required] [--tools] [note for the model]",
     handler: async (args, ctx) => {
       if (/(^|\s)--list(\s|$)/.test(args)) {
         const infos = await listCheckpoints(ctx.cwd);
@@ -327,12 +337,12 @@ export default function (pi: ExtensionAPI) {
       const flag = /--max-steps\s+(\d+)/.exec(args);
       const maxSteps = flag ? Number(flag[1]) : checkpoint.maxSteps;
       const requireReasoning = /--reasoning\s+required/.test(args);
-      const noTools = /(^|\s)--no-tools(\s|$)/.test(args);
+      const withTools = /(^|\s)--tools(\s|$)/.test(args);
       const note = args
         .replace(/--max-steps\s+\d+/, "")
         .replace(/--run\s+\S+/, "")
         .replace(/--reasoning\s+\S+/, "")
-        .replace(/(^|\s)--no-tools(?=\s|$)/, "")
+        .replace(/(^|\s)--tools(?=\s|$)/, "")
         .trim();
       if (checkpoint.outcome === "cannot_complete" && !note && maxSteps <= checkpoint.maxSteps) {
         ctx.ui.notify(
@@ -357,7 +367,7 @@ export default function (pi: ExtensionAPI) {
         resume: checkpoint,
         resumeNote: note || undefined,
         requireReasoning,
-        tools: noTools ? undefined : toolRunner(ctx),
+        tools: withTools ? toolRunner(ctx) : undefined,
       });
     },
   });

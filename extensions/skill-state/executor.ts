@@ -161,15 +161,65 @@ function boundOutput(text: string): string {
   );
 }
 
+const MAX_GLOB_PATTERNS = 64;
+
+/** Top-level (depth-0) comma split of a brace body. */
+function splitAlternatives(body: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "{") depth++;
+    else if (body[i] === "}") depth--;
+    else if (body[i] === "," && depth === 0) {
+      parts.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(body.slice(start));
+  return parts;
+}
+
+/**
+ * Neither git pathspecs nor `grep --include` expand braces, so `{app,spec}/**`
+ * silently matched nothing — indistinguishable from "this symbol is not in the
+ * repository", which sent one run down a wrong branch for 100 steps. Expand
+ * here; malformed braces become an error observation instead of "No matches".
+ */
+export function expandGlob(glob: string): string[] {
+  const open = glob.indexOf("{");
+  if (open === -1) {
+    if (glob.includes("}")) throw new Error("unbalanced } in glob " + JSON.stringify(glob) + "; pass one plain glob such as *.rb or app/**");
+    return [glob];
+  }
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < glob.length; i++) {
+    if (glob[i] === "{") depth++;
+    else if (glob[i] === "}" && --depth === 0) {
+      close = i;
+      break;
+    }
+  }
+  if (close === -1) throw new Error("unbalanced { in glob " + JSON.stringify(glob) + "; pass one plain glob such as *.rb or app/**");
+  const expanded = splitAlternatives(glob.slice(open + 1, close)).flatMap((part) =>
+    expandGlob(glob.slice(0, open) + part + glob.slice(close + 1)),
+  );
+  if (expanded.length > MAX_GLOB_PATTERNS) {
+    throw new Error("glob " + JSON.stringify(glob) + " expands to " + expanded.length + " patterns; pass a simpler glob");
+  }
+  return expanded;
+}
+
 /**
  * Search tracked and untracked-but-not-ignored files with `git grep`, so build
  * output, logs and vendored trees never reach the model. Outside a git work
  * tree fall back to `grep -r`. Returns the raw `path:line:text` lines.
  */
-async function grepLines(cwd: string, pattern: string, glob: string | undefined, signal: AbortSignal): Promise<string[]> {
+async function grepLines(cwd: string, pattern: string, globs: string[], signal: AbortSignal): Promise<string[]> {
   let result = await collect(
     "git",
-    ["grep", "-nIE", "--untracked", "--no-color", "-e", pattern, ...(glob ? ["--", glob] : [])],
+    ["grep", "-nIE", "--untracked", "--no-color", "-e", pattern, ...(globs.length ? ["--", ...globs] : [])],
     cwd,
     DEFAULT_TIMEOUT_MS,
     signal,
@@ -177,7 +227,7 @@ async function grepLines(cwd: string, pattern: string, glob: string | undefined,
   // 128 = not a git repository (or another git error); fall back to plain grep.
   if (result.code === 128) {
     const args = ["-rnIE", "--exclude-dir=.git", "--exclude-dir=node_modules"];
-    if (glob) args.push("--include=" + glob);
+    for (const glob of globs) args.push("--include=" + glob);
     result = await collect("grep", [...args, "-e", pattern, "."], cwd, DEFAULT_TIMEOUT_MS, signal);
   }
   if (result.code === 1) return [];
@@ -314,12 +364,85 @@ function reindent(line: string, oldIndent: string, fileIndent: string): string {
   return ws.slice(0, Math.max(0, ws.length + delta)) + line.slice(ws.length);
 }
 
+const squash = (line: string): string => line.replace(/\s+/g, "");
+
+/** Offset in `line` just after its `count`-th non-whitespace character. */
+function afterNonWhitespace(line: string, count: number): number {
+  let seen = 0;
+  for (let i = 0; i < line.length; i++) {
+    if (!/\s/.test(line[i]) && ++seen === count) return i + 1;
+  }
+  return line.length;
+}
+
+function commonPrefixLength(a: string, b: string): number {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
+/**
+ * Where oldText's first line most plausibly is, from strictest to loosest
+ * comparison. Only used to quote the file back in an error, so a wrong guess
+ * costs nothing while a missing one costs the model the exact text it needs:
+ * in one run the strict lookup failed on all 158 attempts and the model never
+ * saw the file (finding 2 of improvements_3).
+ */
+function findAnchor(fileLines: string[], anchor: string): number {
+  const squashed = squash(anchor);
+  let at = fileLines.findIndex((l) => l.trim() === anchor);
+  if (at !== -1) return at;
+  at = fileLines.findIndex((l) => squash(l) === squashed);
+  if (at !== -1) return at;
+  if (squashed.length >= 8) {
+    at = fileLines.findIndex((l) => {
+      const s = squash(l);
+      return s.length >= 8 && (s.includes(squashed) || squashed.includes(s));
+    });
+    if (at !== -1) return at;
+  }
+  let best = -1;
+  let bestScore = 0;
+  fileLines.forEach((line, i) => {
+    const score = commonPrefixLength(squash(line), squashed);
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  });
+  return bestScore >= Math.max(8, Math.floor(squashed.length / 2)) ? best : -1;
+}
+
+/**
+ * Line-by-line match with all whitespace removed, the last line allowed to be a
+ * prefix of its file line (a fact cut mid-line). Returns the unique start index,
+ * -1 for no match, or every start when ambiguous. Models lose whitespace inside
+ * a line, not just in front of it: 158 of 158 failed patches in one run sent
+ * `action:add_helper_step` for `action :add_helper_step`, which `trim()` cannot
+ * see past (finding 1 of improvements_3).
+ */
+function squashedMatches(fileLines: string[], oldLines: string[]): number[] {
+  const target = oldLines.map(squash);
+  const file = fileLines.map(squash);
+  const last = target.length - 1;
+  const starts: number[] = [];
+  for (let i = 0; i + target.length <= file.length; i++) {
+    let match = true;
+    for (let j = 0; j < target.length && match; j++) {
+      match = j === last && target[j] ? file[i + j].startsWith(target[j]) : file[i + j] === target[j];
+    }
+    if (match) starts.push(i);
+  }
+  return starts;
+}
+
 /**
  * Apply the patch. Exact match first; then a line-by-line match that ignores
  * leading and trailing whitespace, in which case newText is re-indented by the
- * same difference. On no match, the error shows the file where oldText's first
- * line occurs, numbered and exact, so the next attempt has the real text
- * instead of a second guess (10 of 15 patches failed on this in one run).
+ * same difference; then the same comparison with all whitespace removed. On no
+ * match, the error shows the file where oldText's first line occurs, numbered
+ * and exact, so the next attempt has the real text instead of a second guess
+ * (10 of 15 patches failed on this in one run).
  */
 export function applyPatch(text: string, oldText: string, newText: string, rel: string): { text: string; note: string } {
   const first = text.indexOf(oldText);
@@ -355,22 +478,55 @@ export function applyPatch(text: string, oldText: string, newText: string, rel: 
         " when indentation is ignored; include more surrounding context",
     );
   }
-  if (starts.length === 1) {
-    const start = starts[0];
+  /** Replace fileLines[start … start+oldLines.length) with newText re-indented to the file. */
+  const splice = (start: number, tail: string): { text: string; lines: number; fileIndent: string; oldIndent: string } => {
     const fileIndent = leadingWs(fileLines[start + anchorIndex]);
     const oldIndent = leadingWs(oldLines[anchorIndex]);
     const replacement = newLines.map((l) => reindent(l, oldIndent, fileIndent));
-    const out = [...fileLines.slice(0, start), ...replacement, ...fileLines.slice(start + oldLines.length)].join("\n");
+    // A last line matched as a prefix leaves the rest of that file line behind;
+    // carry it over so a patch built from a cut fact cannot truncate the file.
+    if (tail) replacement.push((replacement.pop() ?? "") + tail);
     return {
-      text: out,
+      text: [...fileLines.slice(0, start), ...replacement, ...fileLines.slice(start + oldLines.length)].join("\n"),
+      lines: replacement.length,
+      fileIndent,
+      oldIndent,
+    };
+  };
+  if (starts.length === 1) {
+    const start = starts[0];
+    const out = splice(start, "");
+    return {
+      text: out.text,
       note:
-        "Patched " + rel + " lines " + (start + 1) + "-" + (start + oldLines.length) + " (" + oldLines.length + " → " + replacement.length +
-        " lines). Your oldText was indented " + oldIndent.length + " chars, the file " + fileIndent.length +
+        "Patched " + rel + " lines " + (start + 1) + "-" + (start + oldLines.length) + " (" + oldLines.length + " → " + out.lines +
+        " lines). Your oldText was indented " + out.oldIndent.length + " chars, the file " + out.fileIndent.length +
         "; newText was re-indented to match. Copy indentation exactly next time.",
     };
   }
+  const loose = squashedMatches(fileLines, oldLines);
+  if (loose.length > 1) {
+    throw new Error(
+      "oldText matches at lines " + loose.map((s) => s + 1).join(", ") + " of " + rel +
+        " when whitespace is ignored; include more surrounding context",
+    );
+  }
+  if (loose.length === 1) {
+    const start = loose[0];
+    const lastFileLine = fileLines[start + oldLines.length - 1];
+    const tail = lastFileLine.slice(afterNonWhitespace(lastFileLine, squash(oldLines[oldLines.length - 1]).length));
+    const out = splice(start, tail);
+    return {
+      text: out.text,
+      note:
+        "Patched " + rel + " lines " + (start + 1) + "-" + (start + oldLines.length) + " (" + oldLines.length + " → " + out.lines +
+        " lines), matched ignoring all whitespace: your oldText differed from the file inside the lines, not just in indentation" +
+        (tail ? ", and its last line stopped mid-line (the rest of that line was kept)" : "") +
+        ". newText was re-indented to the file. Copy the text from read_file exactly next time, character for character.",
+    };
+  }
   const anchor = target[anchorIndex];
-  const at = fileLines.findIndex((l) => l.trim() === anchor);
+  const at = findAnchor(fileLines, anchor);
   if (at === -1) {
     throw new Error(
       "oldText not found in " + rel + ": no line of the file equals its first line " + JSON.stringify(anchor.slice(0, 100)) +
@@ -417,13 +573,28 @@ export function reportedFailure(output: string): string | undefined {
   return undefined;
 }
 
+const CHECK_TAIL_LINES = 20;
+
+/**
+ * One line of `checks`, carried in every later prompt. The last line of a test
+ * runner is often its least informative ("Randomized with seed 52951"), so the
+ * tail is scanned for a line that names the failure first.
+ */
+export function checkSummary(output: string): string {
+  const lines = output.split("\n").filter((l) => l.trim());
+  for (const line of lines.slice(-CHECK_TAIL_LINES)) {
+    if (FAILURE_SIGNS.some((re) => re.test(line))) return line.trim().slice(0, 160);
+  }
+  return (lines[lines.length - 1] ?? "").trim().slice(0, 160);
+}
+
 /** Execute one action. Never throws: failures become error observations. */
 export async function execute(action: RepoAction, cwd: string, signal: AbortSignal, tools?: ToolRunner): Promise<ExecutionResult> {
   const header = "Result of " + (action.type === "tool" ? "tool " + action.name : action.type) + ":\n";
   try {
     switch (action.type) {
       case "search_files": {
-        const lines = await grepLines(cwd, action.pattern, action.glob, signal);
+        const lines = await grepLines(cwd, action.pattern, action.glob ? expandGlob(action.glob) : [], signal);
         // Matched files are not inspected files: a broad pattern once added 13
         // schema and migration files the model never opened.
         return { observation: header + boundOutput(formatSearch(lines, action.pattern, action.glob)), kind: lines.length ? "ok" : "empty" };
@@ -465,7 +636,6 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
         const failure = result.code === 0 && !result.timedOut ? reportedFailure(result.output) : undefined;
         const masked = failure ? " (but the output reports a failure: \"" + failure + "\"; treat this as failed)" : "";
         const body = "$ " + action.command + "\n" + status + masked + note + "\n" + boundOutput(result.output);
-        const lastLine = result.output.trim().split("\n").pop() ?? "";
         return {
           observation: header + body,
           kind: result.output.trim() ? "ok" : "empty",
@@ -473,7 +643,7 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
             ? {
                 command: action.command.slice(0, 120),
                 code: result.timedOut ? 124 : result.code,
-                summary: (result.timedOut ? "timeout; " : "") + (failure ? "exit 0 but output reports: " + failure : lastLine.slice(0, 160)),
+                summary: (result.timedOut ? "timeout; " : "") + (failure ? "exit 0 but output reports: " + failure : checkSummary(result.output)),
               }
             : undefined,
         };

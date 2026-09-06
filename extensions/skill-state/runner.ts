@@ -1,5 +1,7 @@
+import { stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import { execute, type ObservationKind, type ToolRunner } from "./executor";
-import { lastFencedJson, reasoningText, render } from "./prompt";
+import { lastFencedJson, reasoningText, render, type RenderedPrompt } from "./prompt";
 import { validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
 import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
 
@@ -26,7 +28,7 @@ export interface ModelReply {
   usage?: { input: number; output: number; cacheRead: number; reasoning?: number };
 }
 
-export type CompleteFn = (prompt: string, signal: AbortSignal) => Promise<ModelReply>;
+export type CompleteFn = (prompt: RenderedPrompt, signal: AbortSignal) => Promise<ModelReply>;
 
 export interface StepTelemetry {
   runId: string;
@@ -146,7 +148,7 @@ async function initialObservation(cwd: string, signal: AbortSignal): Promise<str
 
 async function completeWithRetry(
   complete: CompleteFn,
-  prompt: string,
+  prompt: RenderedPrompt,
   signal: AbortSignal,
   onError: (attempt: number, error: string, durationMs: number) => void,
 ): Promise<{ reply: ModelReply; attempts: number }> {
@@ -165,14 +167,69 @@ async function completeWithRetry(
   throw lastError;
 }
 
+/** A write that failed earlier, its error, and the file as it was then. */
+interface FailedWrite {
+  step: number;
+  error: string;
+  mtimeMs: number;
+}
+
+async function mtimeOf(cwd: string, path: string): Promise<number> {
+  try {
+    return (await stat(resolve(cwd, path))).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * A byte-identical write that already failed against the same file contents
+ * cannot do anything but fail again, so it is refused before it runs instead of
+ * costing a step (one run repeated a single rejected patch 30 times). The file
+ * is re-stat'd rather than assumed unchanged: something outside the run may
+ * have edited it, and then the earlier failure says nothing.
+ */
+async function repeatedFailedWrite(
+  failedWrites: Map<string, FailedWrite>,
+  action: RepoAction,
+  cwd: string,
+): Promise<FailedWrite | undefined> {
+  if (action.type !== "write_file" && action.type !== "patch_file") return undefined;
+  const key = JSON.stringify(action);
+  const earlier = failedWrites.get(key);
+  if (!earlier) return undefined;
+  if ((await mtimeOf(cwd, action.path)) === earlier.mtimeMs) return earlier;
+  failedWrites.delete(key);
+  return undefined;
+}
+
+/**
+ * First line of a resumed run. Without it the model is handed the same state in
+ * the same phase and repeats the segment that just failed: one resume spent 96
+ * further steps on the loop that had exhausted the first budget (§11).
+ */
+function resumeHeader(state: SkillExecutionState): string {
+  const idle = state.step - state.lastWriteStep;
+  return (
+    "You have been resumed at step " + (state.step + 1) + '; the previous segment ended in "' + state.status + '" and ' +
+    (state.lastWriteStep
+      ? "last changed a file at step " + state.lastWriteStep + " (" + idle + " steps before it stopped)"
+      : "never changed a file") +
+    ". Doing again what that segment did will end the same way: re-read what you are about to edit, or change approach."
+  );
+}
+
 export async function run(options: RunOptions): Promise<RunSummary> {
   const { runId, objective, spec, cwd, signal, complete, resume } = options;
   const specBytes = Buffer.byteLength(spec);
   let state = resume ? structuredClone(resume.state) : createInitialState(objective);
+  // Checkpoints written before lastWriteStep existed resume as if nothing was written.
+  state.lastWriteStep = state.lastWriteStep ?? 0;
   let observation = resume ? resume.observation : await initialObservation(cwd, signal);
-  if (resume && options.resumeNote) {
+  if (resume) {
     observation =
-      "Operator note (the run was resumed; act on this before anything else):\n" + options.resumeNote +
+      resumeHeader(state) +
+      (options.resumeNote ? "\n\nOperator note (act on this before anything else):\n" + options.resumeNote : "") +
       "\n\nPrevious observation:\n" + resume.observation;
   }
   const totals = resume ? { ...resume.totals } : { input: 0, output: 0, cacheRead: 0 };
@@ -190,6 +247,12 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   // Identical read/search actions return identical results until a file
   // changes; tell the model so instead of letting it loop (paper §7, cond. 2).
   const seenReads = new Map<string, number>();
+  // The same applies to writes, and there it is provable: a byte-identical
+  // write that failed against an unchanged file fails again. One run sent 22
+  // distinct patches 158 times, one of them 30 times (improvements_3 §5).
+  const failedWrites = new Map<string, FailedWrite>();
+  // Path of a patch_file that failed on the previous step, if any.
+  let lastFailedPatch: string | undefined;
 
   const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => {
     const own = steps - firstStep;
@@ -244,7 +307,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     // Rollback-retry: every attempt is a fresh (P, Σt, Ot [+ errors]) prompt.
     while (!accepted) {
       const prompt = render(spec, state, observation, options.maxSteps, errors, options.tools?.vocabulary);
-      promptBytes = Buffer.byteLength(prompt);
+      promptBytes = Buffer.byteLength(prompt.system) + Buffer.byteLength(prompt.user);
       stateBytes = Buffer.byteLength(serializeState(state));
       observationBytes = Buffer.byteLength(observation);
 
@@ -293,13 +356,22 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           if (!merged.ok) errors = merged.errors;
           else {
             errors = actionErrors(merged.state, response.action.type);
+            const repeat = errors.length ? undefined : await repeatedFailedWrite(failedWrites, response.action, cwd);
+            if (repeat) {
+              errors = [
+                "/action: this exact " + response.action.type + " already failed at step " + repeat.step +
+                  " and no file has changed since, so it fails again. It was rejected with: " + repeat.error +
+                  "\nSend a different action: read the region again and copy the text from the observation, or edit a different part of the file.",
+              ];
+              hard = true;
+            }
             if (!errors.length) {
               accepted = { response, next: merged.state, notices: merged.notices, reasoningChars: reasoning.length, replyChars: reply.text.length };
             }
           }
         }
       }
-      emit({ type: "attempt", step, attempt: attemptNo, prompt, reply: reply.text, usage: reply.usage, errors: errors ?? [], durationMs: Date.now() - attemptStarted });
+      emit({ type: "attempt", step, attempt: attemptNo, prompt: prompt.system + "\n\n" + prompt.user, reply: reply.text, usage: reply.usage, errors: errors ?? [], durationMs: Date.now() - attemptStarted });
       if (!accepted) {
         retries++;
         if (hard) hardRejections++;
@@ -328,20 +400,37 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     maxPromptBytes = Math.max(maxPromptBytes, promptBytes);
 
     const result = await execute(action, cwd, signal, options.tools);
-    recordAction(state, action.type);
+    recordAction(state, action.type, result.changed !== undefined);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
     if (action.type === "read_file" || action.type === "search_files") {
       const key = JSON.stringify(action);
       const earlier = seenReads.get(key);
       if (earlier !== undefined) {
+        // "Use facts instead" is right for structural knowledge and wrong right
+        // after a failed patch: the model then patched from its own mangled
+        // copy of the line it was looking at (improvements_3 §6).
         result.observation =
-          "Note: this exact action already ran at step " + earlier + " and nothing changed since. " +
-          "Record what you need in facts instead of repeating it.\n" + result.observation;
+          (action.type === "read_file" && lastFailedPatch === action.path
+            ? "Note: this exact action already ran at step " + earlier +
+              ". Your last patch on this file failed: the text below is the file, copy oldText from it character for character, do not retype it from facts.\n"
+            : "Note: this exact action already ran at step " + earlier + " and nothing changed since. " +
+              "Record what you need in facts instead of repeating it.\n") + result.observation;
       }
       seenReads.set(key, step);
     } else if (result.changed) {
       seenReads.clear();
     }
+    if (action.type === "write_file" || action.type === "patch_file") {
+      if (result.changed) failedWrites.clear();
+      else {
+        failedWrites.set(JSON.stringify(action), {
+          step,
+          error: result.observation.split("\n").slice(0, 12).join("\n").slice(0, 800),
+          mtimeMs: await mtimeOf(cwd, action.path),
+        });
+      }
+    }
+    lastFailedPatch = action.type === "patch_file" && !result.changed ? action.path : undefined;
     for (const path of result.inspected ?? []) recordInspected(state, path);
     if (result.changed) recordChanged(state, result.changed);
     if (result.check) recordCheck(state, result.check);

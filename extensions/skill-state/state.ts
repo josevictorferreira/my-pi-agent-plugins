@@ -5,13 +5,16 @@ import type { SkillExecutionState, StatePatch } from "./schemas";
 // values are cut instead and reported in the next observation: models cannot
 // count characters, and "value longer than 300 chars" was 14 of 25 rejections
 // in one run, killing it once on three consecutive 301-430 char values.
+// The cut is marked in the value itself: at 300 chars a run split one 99-char
+// source line across six keys and then patched from a fact that had been cut
+// mid-token, which a trailing "…" did not warn it about (improvements_3 §7).
 // 12 KB / 40 facts: the paper's 6 KB suited shelf and CTF tasks; on source
 // code the state grew ~140 B per step and hit 6 KB around step 40, forcing
 // fact deletion (the "premature overwrite" failure). Still O(1) per step.
 export const MAX_STATE_BYTES = 12 * 1024;
 const MAX_FACTS = 40;
 const MAX_FACT_KEY_CHARS = 64;
-const MAX_FACT_VALUE_CHARS = 300;
+const MAX_FACT_VALUE_CHARS = 600;
 const MAX_HYPOTHESES = 12;
 const MAX_HYPOTHESIS_CHARS = 200;
 const MAX_LIST_ITEMS = 15;
@@ -24,6 +27,7 @@ export function createInitialState(objective: string): SkillExecutionState {
     step: 0,
     statusSince: 0,
     readsSinceWrite: 0,
+    lastWriteStep: 0,
     objective,
     inspectedFiles: [],
     changedFiles: [],
@@ -40,8 +44,10 @@ export function serializeState(state: SkillExecutionState): string {
   return JSON.stringify(state);
 }
 
+const CUT_MARKER = " [CUT]";
+
 function clip(value: string, max: number): string {
-  return value.length > max ? value.slice(0, max - 1) + "…" : value;
+  return value.length > max ? value.slice(0, max) + CUT_MARKER : value;
 }
 
 /** Merge one string map with null-delete, cutting over-long values and noting each cut. */
@@ -50,7 +56,10 @@ function mergeMap(target: Record<string, string>, patch: Record<string, string |
     if (value === null) delete target[key];
     else {
       if (value.length > max) {
-        notices.push(field + "." + key + " was " + value.length + " chars; kept the first " + max + ". Split long notes across keys.");
+        notices.push(
+          field + "." + key + " was " + value.length + " chars; kept the first " + max + " and marked the value \"" + CUT_MARKER.trim() +
+            "\". It is no longer exact text: do not patch from it. Split long notes across keys.",
+        );
       }
       target[key] = clip(value, max);
     }
@@ -111,8 +120,14 @@ export function inspectBudget(maxSteps: number): number {
 
 /** `planning` is where the plan gets written; after this many steps the run must edit. */
 export const PLANNING_STEPS = 2;
-/** In `editing`, read-only actions allowed between two writes. */
+/** In `editing`, actions that changed nothing allowed between two writes. */
 export const READS_BEFORE_EDIT = 3;
+/**
+ * Steps `editing` may run without a file actually changing. `inspecting` and
+ * `planning` are budgeted; `editing` was not, and one run spent 138 consecutive
+ * steps there re-sending a patch that could not apply (improvements_3 §4).
+ */
+export const EDIT_STALL_STEPS = 12;
 
 function phaseErrors(prev: SkillExecutionState, next: SkillExecutionState, patch: StatePatch, policy: PhasePolicy): string[] {
   const errors: string[] = [];
@@ -165,22 +180,44 @@ const WRITE_ACTIONS = new Set(["write_file", "patch_file"]);
 
 /**
  * Action policy for the step being decided: in `editing`, after
- * READS_BEFORE_EDIT read-only actions without a write, the next action must be
- * an edit or finish. Facts hold what was learned; re-reading is not progress.
+ * READS_BEFORE_EDIT actions that changed nothing the next action must be an
+ * edit or finish, and after EDIT_STALL_STEPS steps with no file changed the
+ * phase itself has to end. Facts hold what was learned; re-reading is not
+ * progress, and neither is a patch that keeps being rejected.
  */
 export function actionErrors(next: SkillExecutionState, actionType: string): string[] {
+  if (actionType === "finish") return [];
+  // `testing` is the one phase whose steps are meant to change nothing.
+  const stalled = next.step + 1 - Math.max(next.statusSince, next.lastWriteStep) - 1;
+  if ((next.status === "editing" || next.status === "repairing") && stalled >= EDIT_STALL_STEPS) {
+    return [
+      "/status: " + stalled + " steps in \"" + next.status + "\" and no file has changed" +
+        (next.lastWriteStep ? " since step " + next.lastWriteStep : " at all") +
+        ". Repeating the same edit will not start working. Record in facts what the failed attempts have in common, then change status to a " +
+        "different phase (\"repairing\" to diagnose the failure, \"testing\" if the change is already in place) or send finish with what remains.",
+    ];
+  }
   if (next.status !== "editing") return [];
-  if (next.readsSinceWrite < READS_BEFORE_EDIT || WRITE_ACTIONS.has(actionType) || actionType === "finish") return [];
+  if (next.readsSinceWrite < READS_BEFORE_EDIT || WRITE_ACTIONS.has(actionType)) return [];
   return [
-    "/action: " + next.readsSinceWrite + " read-only actions since the last edit while in \"editing\". " +
+    "/action: " + next.readsSinceWrite + " actions since the last file change while in \"editing\" (failed edits count). " +
       "The next action must be write_file or patch_file applying the first plan item (use the exact text you already read), or finish.",
   ];
 }
 
-/** Track read-only vs write actions for the action policy. */
-export function recordAction(state: SkillExecutionState, actionType: string): void {
-  if (WRITE_ACTIONS.has(actionType)) state.readsSinceWrite = 0;
-  else if (READ_ONLY_ACTIONS.has(actionType)) state.readsSinceWrite++;
+/**
+ * Track progress for the action policy. Only an action that actually changed a
+ * file counts as a write: a rejected patch_file used to reset the read streak,
+ * so `read_file → failed patch_file → …` disabled the only loop guard there is
+ * (it fired once in 346 steps; improvements_3 §3).
+ */
+export function recordAction(state: SkillExecutionState, actionType: string, changed: boolean): void {
+  if (changed) {
+    state.readsSinceWrite = 0;
+    state.lastWriteStep = state.step;
+  } else if (READ_ONLY_ACTIONS.has(actionType) || WRITE_ACTIONS.has(actionType)) {
+    state.readsSinceWrite++;
+  }
 }
 
 /** Atomic merge: validate → clone → merge → bound-check → commit or reject. */
