@@ -59,6 +59,38 @@ export interface StepTelemetry {
   replyChars: number;
   /** Hidden reasoning tokens across the step's attempts, when the provider reports them. */
   reasoningTokens?: number;
+  // Everything below exists so the transcript can show what the step actually
+  // did. The run log keeps the full action, state and observation; these are the
+  // bounded projections the TUI renders, since session entries are kept small.
+  /** The action with its target: `patch_file app/models/editor.rb`. */
+  actionSummary: string;
+  /** The observation's first meaningful line: `Patched …`, `Error: …`, `exit code 1`. */
+  resultLine: string;
+  /** Whether that line reports success. A shell command that ran but exited non-zero is not a success. */
+  resultOk: boolean;
+  /** Up to 12 lines / 800 chars of the observation. */
+  observationPreview: string;
+  /** Up to 300 chars of the reasoning the runtime discards after parsing. */
+  reasoningHead: string;
+  /** `editing → testing` when the accepted patch changed phase. */
+  statusChange?: string;
+  /** facts/hypotheses keys the accepted patch wrote, `-key` for a delete. */
+  patchedKeys: string[];
+  /** Plan items left after the merge. */
+  planLeft: number;
+  /** Files changed so far in the run. */
+  changedCount: number;
+}
+
+/** Live position of a step, for a status line while the model is slow. */
+export interface StepProgress {
+  step: number;
+  status: SkillExecutionState["status"];
+  /** `thinking` while the model is being called, `acting` while the action runs. */
+  phase: "thinking" | "acting";
+  attempt: number;
+  /** Set once the reply is accepted: the action about to run. */
+  actionSummary?: string;
 }
 
 export type RunStatus = "completed" | "failed" | "cancelled";
@@ -135,6 +167,66 @@ export interface RunOptions {
   tools?: ToolRunner & { vocabulary: string; validate: (name: string, params: unknown) => string[] };
   /** Reject (once per step) a reply that has no reasoning before the JSON block. */
   requireReasoning?: boolean;
+  /** Called while a step is in flight, for a live status line. */
+  onProgress?: (progress: StepProgress) => void;
+}
+
+const MAX_SUMMARY_CHARS = 120;
+const MAX_RESULT_LINE_CHARS = 200;
+const MAX_PREVIEW_LINES = 12;
+const MAX_PREVIEW_CHARS = 800;
+const MAX_REASONING_HEAD = 300;
+
+/** The action and what it points at, in one line. */
+export function describeAction(action: RepoAction): string {
+  const detail = (() => {
+    switch (action.type) {
+      case "read_file":
+        return action.path + (action.offset ? ":" + action.offset : "");
+      case "search_files":
+        return "/" + action.pattern + "/" + (action.glob ? " in " + action.glob : "");
+      case "write_file":
+      case "patch_file":
+        return action.path;
+      case "exec_shell":
+        return action.command;
+      case "git_diff":
+        return (action.paths ?? []).join(" ");
+      case "tool":
+        return action.name;
+      case "finish":
+        return action.outcome + ": " + action.summary;
+    }
+  })();
+  const label = action.type === "tool" ? "tool" : action.type;
+  return (detail ? label + " " + detail : label).replace(/\s+/g, " ").slice(0, MAX_SUMMARY_CHARS);
+}
+
+/** The observation without its `Result of <action>:` header. */
+function observationBody(observation: string): string {
+  const firstLine = observation.indexOf("\n");
+  return firstLine === -1 ? observation : observation.slice(firstLine + 1);
+}
+
+/** The line that says how the action went: for a shell command that is its exit status, not the command. */
+function resultLineOf(action: RepoAction, body: string): string {
+  const lines = body.split("\n").filter((l) => l.trim());
+  const line = action.type === "exec_shell" ? (lines[1] ?? lines[0]) : lines[0];
+  return (line ?? "").trim().slice(0, MAX_RESULT_LINE_CHARS);
+}
+
+/** A shell command that ran fine and failed is still a failure to whoever is watching. */
+const FAILED_RESULT = /^(exit code [1-9]|timed out|aborted|Error\b)/;
+
+function previewOf(body: string): string {
+  return body.split("\n").slice(0, MAX_PREVIEW_LINES).join("\n").slice(0, MAX_PREVIEW_CHARS);
+}
+
+/** facts/hypotheses keys the patch wrote, `-key` for a delete. */
+function patchedKeysOf(patch: StatePatch): string[] {
+  return [...Object.entries(patch.facts ?? {}), ...Object.entries(patch.hypotheses ?? {})].map(
+    ([key, value]) => (value === null ? "-" : "") + key,
+  );
 }
 
 async function initialObservation(cwd: string, signal: AbortSignal): Promise<string> {
@@ -296,7 +388,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     const rejections: string[] = [];
     let errors: string[] | undefined;
     let accepted:
-      | { response: StepResponse; next: SkillExecutionState; notices: string[]; reasoningChars: number; replyChars: number }
+      | { response: StepResponse; next: SkillExecutionState; notices: string[]; reasoning: string; replyChars: number }
       | undefined;
     let reasoningAsked = false;
     let promptBytes = 0;
@@ -314,6 +406,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       let reply: ModelReply;
       const attemptStarted = Date.now();
       let attemptNo = retries + 1;
+      options.onProgress?.({ step, status: state.status, phase: "thinking", attempt: attemptNo });
       try {
         const attempt = await completeWithRetry(complete, prompt, signal, (n, error, durationMs) =>
           emit({ type: "provider_error", step, attempt: n, error, durationMs }),
@@ -366,7 +459,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
               hard = true;
             }
             if (!errors.length) {
-              accepted = { response, next: merged.state, notices: merged.notices, reasoningChars: reasoning.length, replyChars: reply.text.length };
+              accepted = { response, next: merged.state, notices: merged.notices, reasoning, replyChars: reply.text.length };
             }
           }
         }
@@ -386,6 +479,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     }
 
     // Commit Σt+1 (statusSince / readsSinceWrite were set by merge), then execute at.
+    const statusBefore = state.status;
     state = accepted.next;
     state.step = step;
     steps = step;
@@ -399,7 +493,11 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     minPromptBytes = Math.min(minPromptBytes, promptBytes);
     maxPromptBytes = Math.max(maxPromptBytes, promptBytes);
 
+    const actionSummary = describeAction(action);
+    options.onProgress?.({ step, status: state.status, phase: "acting", attempt: retries + 1, actionSummary });
     const result = await execute(action, cwd, signal, options.tools);
+    const body = observationBody(result.observation);
+    const resultLine = resultLineOf(action, body);
     recordAction(state, action.type, result.changed !== undefined);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
     if (action.type === "read_file" || action.type === "search_files") {
@@ -461,9 +559,18 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       actionOk: result.kind !== "error",
       observationKind: result.kind,
       toolName: action.type === "tool" ? action.name : undefined,
-      reasoningChars: accepted.reasoningChars,
+      reasoningChars: accepted.reasoning.length,
       replyChars: accepted.replyChars,
       reasoningTokens: reasoningReported ? usage.reasoning : undefined,
+      actionSummary,
+      resultLine: resultLine.replace(/^Error: /, ""),
+      resultOk: result.kind !== "error" && !FAILED_RESULT.test(resultLine),
+      observationPreview: previewOf(body),
+      reasoningHead: accepted.reasoning.slice(0, MAX_REASONING_HEAD),
+      statusChange: state.status === statusBefore ? undefined : statusBefore + " → " + state.status,
+      patchedKeys: patchedKeysOf(accepted.response.state_patch),
+      planLeft: state.plan.length,
+      changedCount: state.changedFiles.length,
     };
     emit({ type: "step", step, action, statePatch: accepted.response.state_patch, state, observation, telemetry });
     options.onStep(telemetry, state);

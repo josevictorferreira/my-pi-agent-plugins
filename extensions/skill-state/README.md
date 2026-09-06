@@ -79,7 +79,7 @@ produce an error observation, not a crash.
 
 ### Extension tools
 
-Pi lets an extension list other extensions' tools but not run them, so the sibling extensions in this package hand their read-only tool definitions to `tool-registry.ts` by wrapping the definition: `pi.registerTool(stateRunTool({ ... }))`. The registry lives on `globalThis`, because Pi may load each extension through its own module cache. Currently shared: `codegraph_explore`, `codegraph_node`, `codegraph_query` and `codegraph_search` (when CodeGraph registers them), `context7_resolve_library_id`, `context7_query_docs`, `lsp`, `web_search`, `web_fetch`, `hindsight_recall`. Writing tools (`hindsight_retain`) are deliberately not shared: edits stay with `patch_file`/`write_file` so change tracking and the phase policy keep working. The vocabulary section in the prompt is generated from the registry (name, first sentence of the description, parameter names and types), about 1 KB for the full set. Tools from third-party packages are not reachable.
+Pi lets an extension list other extensions' tools but not run them, so the sibling extensions in this package hand their read-only tool definitions to `tool-registry.ts` by wrapping the definition: `pi.registerTool(stateRunTool({ ... }))`. The registry lives on `globalThis`, because Pi may load each extension through its own module cache. Currently shared: `codegraph_explore`, `codegraph_node`, `codegraph_query` and `codegraph_impact`, `context7_resolve_library_id`, `context7_query_docs`, `lsp`, `web_search`, `web_fetch`, `hindsight_recall`. A tool is only in the registry if its own extension registered it in this session: CodeGraph registers on `session_start` and only when its binary is on PATH, the project is indexed, and the tool is in `CODEGRAPH_TOOLS` (default `explore,node`), so `/state-run --tools` in an unindexed project sees no `codegraph_*` at all. Writing tools (`hindsight_retain`) are deliberately not shared: edits stay with `patch_file`/`write_file` so change tracking and the phase policy keep working. The vocabulary section in the prompt is generated from the registry (name, first sentence of the description, parameter names and types), about 1 KB for the full set. Tools from third-party packages are not reachable.
 
 ## State schema
 
@@ -129,8 +129,13 @@ An objective typed in quotes (`/state-run "fix the …"`) has the quotes strippe
 
 ## What lands in the Pi session
 
-- `skill-state-step` custom entry per step: prompt/state/observation bytes, token usage (with hidden reasoning tokens when reported), reply characters, retries, re-read count, duration. Rendered as one line in the transcript, expandable to the full JSON.
-- `skill-state-run` custom entry at the end with the run summary table.
+- **A live panel above the editor while the run is going** (`ui.setWidget`, cleared when the run ends). A step can take minutes, so the panel pins what scrolls away: run id, step and budget, phase, files changed, checks run; what the run is doing *right now* (`thinking`, with the attempt number when a reply was rejected, or the action it is executing) and how long that has taken; the result of the previous step; and the first plan item. It repaints on every phase change and once a second, so the elapsed time keeps moving. The footer status line carries the same position in one line.
+- `skill-state-step` custom entry per step, three lines:
+  - `state-run 12 editing → patch_file app/models/editor.rb  1.6k→430 48s` — the action **with its target**, not just its type, plus tokens and wall time, and `rejected Nx` when the reply was re-asked;
+  - `✓ Patched app/models/editor.rb lines 36-37 (2 → 3 lines)` — the first line of the observation, green or red. A shell command that ran and exited non-zero shows red: it ran, and it failed;
+  - `editing → testing · facts registry_exact, -old_guess · plan 2 left · 2 changed` — what the accepted state patch did.
+  Expanded (the tool-output expansion key, `/help` shows the binding) adds the model's reasoning for that step (the runtime discards it after parsing; this is the only place it is visible), each rejection, up to 12 lines of the observation, and the byte/token detail. The full prompt, reply, state and observation stay in the run log, which is what `tools/runlog.ts` reads.
+- `skill-state-run` custom entry at the end with the run summary table, including a row per recorded check.
 - Both are custom entries and are **never sent to the LLM**.
 - One `skill-state-result` custom message (≤ 1 KB: outcome, summary, changed files, last checks, token totals) is queued for the outer conversation with `deliverAs: "nextTurn"`. It enters context only when you next speak; no turn is triggered. This is the only way the run affects the outer agent's context, whatever the step count.
 

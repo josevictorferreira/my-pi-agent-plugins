@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { complete } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
-import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepTelemetry } from "./runner";
+import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepProgress, type StepTelemetry } from "./runner";
+import type { SkillExecutionState } from "./schemas";
 import { listCheckpoints, loadCheckpoint, removeCheckpoint, saveCheckpoint } from "./checkpoints";
 import { listRunLogs, openRunLog, runLogDir } from "./runlog";
 import { hasStateRunTool, listStateRunTools, runStateRunTool, validateToolParams } from "./tool-registry";
@@ -116,6 +117,66 @@ async function makeComplete(ctx: ExtensionCommandContext, runId: string): Promis
   };
 }
 
+const clip = (text: string, max: number): string => (text.length > max ? text.slice(0, max - 1) + "…" : text);
+
+function tokens(n: number): string {
+  return n >= 1000 ? (n / 1000).toFixed(n >= 10_000 ? 0 : 1) + "k" : String(n);
+}
+
+function duration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? s + "s" : Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s";
+}
+
+/**
+ * The panel above the editor while a run is going. A step can take minutes, so
+ * the run's position, what it is doing right now and how the last step went are
+ * pinned instead of scrolling past in the transcript.
+ */
+export function widgetLines(
+  view: {
+    runId: string;
+    maxSteps: number;
+    progress?: StepProgress;
+    last?: StepTelemetry;
+    state?: SkillExecutionState;
+    phaseSince: number;
+  },
+  theme: { fg: (c: any, t: string) => string; bold: (t: string) => string },
+): string {
+  const { progress, last, state } = view;
+  const step = progress?.step ?? last?.step ?? 0;
+  const status = progress?.status ?? last?.status ?? state?.status ?? "inspecting";
+  const head =
+    theme.fg("dim", "state-run " + view.runId + "  ") +
+    theme.fg("accent", "step " + step + "/" + view.maxSteps) + "  " + theme.bold(status) +
+    theme.fg("dim",
+      (state?.changedFiles.length ? "  " + state.changedFiles.length + " changed" : "") +
+      (state?.checks.length ? "  " + state.checks.length + (state.checks.length === 1 ? " check" : " checks") : ""));
+  const elapsed = duration(Date.now() - view.phaseSince);
+  const now = progress
+    ? (progress.phase === "thinking"
+        ? theme.fg("muted", "thinking" + (progress.attempt > 1 ? " (attempt " + progress.attempt + ")" : ""))
+        : clip(progress.actionSummary ?? "", 110))
+    : theme.fg("muted", "idle");
+  const lines = [head, theme.fg("dim", "  now   ") + now + theme.fg("dim", "  " + elapsed)];
+  if (last?.resultLine) {
+    const ok = last.resultOk ?? last.actionOk;
+    lines.push(
+      theme.fg("dim", "  last  ") + (ok ? theme.fg("success", "✓ ") : theme.fg("error", "✗ ")) +
+        theme.fg(ok ? "toolOutput" : "error", clip(last.resultLine, 110)),
+    );
+  }
+  const next = state?.plan[0];
+  if (next) {
+    lines.push(
+      theme.fg("dim", "  plan  ") + clip(next, 110) +
+        (state.plan.length > 1 ? theme.fg("dim", "  (+" + (state.plan.length - 1) + " more)") : ""),
+    );
+  }
+  return lines.join("\n");
+}
+
 /** ≤ 1 KB projection of the run for the outer conversation (plan §8). */
 function resultMessage(summary: RunSummary): string {
   const lines = [
@@ -148,19 +209,42 @@ function resultMessage(summary: RunSummary): string {
 export default function (pi: ExtensionAPI) {
   let active: { runId: string; controller: AbortController } | undefined;
 
+  // The step line is the only place a run is visible while it runs, so it shows
+  // what the step did (action, target, result) rather than only its shape.
+  // Everything wider than that is behind the tool-output expansion key.
   pi.registerEntryRenderer<StepTelemetry>("skill-state-step", (entry, { expanded }, theme) => {
     const t = entry.data;
     if (!t) return undefined;
+    const ok = t.resultOk ?? t.actionOk;
     let line =
       theme.fg("dim", "state-run ") +
-      "step " + t.step + " " + theme.bold(t.status) + " → " + t.actionType +
-      theme.fg("dim", "  prompt " + t.promptBytes + " B, in " + t.input + " / out " + t.output +
-        (t.reasoningTokens !== undefined ? " (" + t.reasoningTokens + " reasoning)" : ""));
+      theme.fg("accent", String(t.step)) + " " + theme.bold(t.status) + " → " +
+      clip(t.actionSummary ?? t.actionType, 64) +
+      theme.fg("dim", "  " + tokens(t.input) + "→" + tokens(t.output) + " " + duration(t.durationMs));
     if (t.retries) line += theme.fg("warning", "  rejected " + t.retries + "x");
     if (t.providerRetries) line += theme.fg("warning", "  provider retries " + t.providerRetries);
+    // Second line: what came back. Reading it is the whole point of watching a run.
+    if (t.resultLine) {
+      line += "\n" + (ok ? theme.fg("success", "  ✓ ") : theme.fg("error", "  ✗ ")) +
+        theme.fg(ok ? "toolOutput" : "error", t.resultLine);
+    }
+    const state = [
+      t.statusChange,
+      t.patchedKeys?.length ? "facts " + t.patchedKeys.join(", ") : undefined,
+      t.planLeft ? "plan " + t.planLeft + " left" : undefined,
+      t.changedCount ? t.changedCount + " changed" : undefined,
+    ].filter(Boolean);
+    if (state.length) line += "\n" + theme.fg("dim", "  " + state.join(" · "));
     if (expanded) {
+      if (t.reasoningHead) line += "\n" + theme.fg("muted", "  reasoning  " + t.reasoningHead.replace(/\n/g, " "));
       for (const r of t.rejections) line += "\n" + theme.fg("warning", "  rejected: " + r);
-      line += "\n" + theme.fg("dim", JSON.stringify(t, null, 2));
+      // The first preview line is the result line already shown above it.
+      const preview = (t.observationPreview ?? "").split("\n").slice(t.resultLine ? 1 : 0);
+      if (preview.length) line += "\n" + preview.map((l) => theme.fg("toolOutput", "  │ " + l)).join("\n");
+      line += "\n" + theme.fg("dim",
+        "  prompt " + t.promptBytes + " B (state " + t.stateBytes + ", observation " + t.observationBytes + "), reply " +
+        t.replyChars + " chars" + (t.reasoningTokens ? ", " + tokens(t.reasoningTokens) + " hidden reasoning" : "") +
+        (t.cacheRead ? ", " + tokens(t.cacheRead) + " cached" : "") + ", re-reads " + t.reReadCount);
     }
     return new Text(line);
   });
@@ -177,9 +261,10 @@ export default function (pi: ExtensionAPI) {
       ["re-reads", String(s.reReadCount)],
       ["changed files", s.changedFiles.join(", ") || "none"],
     ];
+    const clip = (t: string, n: number) => (expanded || t.length <= n ? t : t.slice(0, n - 1) + "…");
+    for (const check of s.checks) rows.push(["check → " + check.code, clip(check.command + "  " + check.summary, 160)]);
     if (s.error) rows.push(["error", s.error]);
     if (s.logPath) rows.push(["log", s.logPath]);
-    const clip = (t: string, n: number) => (expanded || t.length <= n ? t : t.slice(0, n - 1) + "…");
     if (s.blockers.length) rows.push(["blockers", s.blockers.map((b) => clip(b, 160)).join(" | ")]);
     if (s.summary) rows.push(["summary", clip(s.summary, 400)]);
     const width = Math.max(...rows.map(([k]) => k.length));
@@ -215,6 +300,21 @@ export default function (pi: ExtensionAPI) {
     const log = openRunLog(ctx.cwd, options.runId);
     const controller = new AbortController();
     active = { runId: options.runId, controller };
+
+    const view = {
+      runId: options.runId,
+      maxSteps: options.maxSteps,
+      progress: undefined as StepProgress | undefined,
+      last: undefined as StepTelemetry | undefined,
+      state: options.resume?.state,
+      phaseSince: Date.now(),
+    };
+    // Repainted on every phase change and once a second, so the elapsed time of
+    // a step that takes minutes keeps moving.
+    const paint = () =>
+      ctx.ui.setWidget("state-run", (_tui, theme) => new Text(widgetLines(view, theme)), { placement: "aboveEditor" });
+    const ticker = setInterval(paint, 1000);
+    paint();
     ctx.ui.setStatus("state-run", "step " + (options.resume?.state.step ?? 0) + " starting");
 
     let summary: RunSummary;
@@ -226,13 +326,27 @@ export default function (pi: ExtensionAPI) {
         complete,
         onEvent: log.write,
         model: ctx.model ? ctx.model.provider + "/" + ctx.model.id : undefined,
-        onStep: (telemetry) => {
+        onProgress: (progress) => {
+          view.progress = progress;
+          view.phaseSince = Date.now();
+          paint();
+          ctx.ui.setStatus(
+            "state-run",
+            "step " + progress.step + "/" + options.maxSteps + " " + progress.status + " " +
+              (progress.phase === "thinking" ? "thinking" + (progress.attempt > 1 ? " (attempt " + progress.attempt + ")" : "") : progress.actionSummary),
+          );
+        },
+        onStep: (telemetry, state) => {
           pi.appendEntry("skill-state-step", telemetry);
-          ctx.ui.setStatus("state-run", "step " + telemetry.step + " " + telemetry.status + " " + telemetry.actionType);
+          view.last = telemetry;
+          view.state = state;
+          paint();
         },
       });
     } finally {
       active = undefined;
+      clearInterval(ticker);
+      ctx.ui.setWidget("state-run", undefined);
       ctx.ui.setStatus("state-run", undefined);
     }
 
