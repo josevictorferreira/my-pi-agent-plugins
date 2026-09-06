@@ -28,11 +28,11 @@ export interface ExecutionResult {
   observation: string;
   /** "error" when the action itself failed (bad path, no match, tool error); "empty" for a valid but empty result. */
   kind: ObservationKind;
-  /** Path read by read_file or matched by search_files (for inspectedFiles). */
+  /** Path read by read_file (for inspectedFiles). */
   inspected?: string[];
   /** Path written by write_file / patch_file (for changedFiles). */
   changed?: string;
-  /** exec_shell result summary (for checks). */
+  /** Result of an exec_shell that ran a test, build or lint command (for checks). */
   check?: { command: string; code: number; summary: string };
 }
 
@@ -112,8 +112,20 @@ function collect(
   });
 }
 
-function runShell(command: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<ShellResult> {
-  return collect("sh", ["-c", command], cwd, timeoutMs, signal);
+// `rspec ... | tail -n 40` exits 0 under plain sh whatever rspec did. Probe once
+// whether this system's sh knows pipefail (bash and busybox do, dash does not).
+let pipefailSupport: Promise<boolean> | undefined;
+function shSupportsPipefail(): Promise<boolean> {
+  pipefailSupport ??= collect("sh", ["-c", "set -o pipefail"], process.cwd(), 5000, new AbortController().signal).then(
+    (r) => r.code === 0,
+    () => false,
+  );
+  return pipefailSupport;
+}
+
+async function runShell(command: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<ShellResult> {
+  const prefix = (await shSupportsPipefail()) ? "set -o pipefail; " : "";
+  return collect("sh", ["-c", prefix + command], cwd, timeoutMs, signal);
 }
 
 /** Resolve a model-supplied path under cwd; throws a plain message when it escapes. */
@@ -197,9 +209,9 @@ function searchRank(path: string): number {
  * lines tells the model nothing, so it gets a per-file match map (code first,
  * then by count) and is asked to narrow the pattern.
  */
-function formatSearch(lines: string[], pattern: string, glob: string | undefined): { text: string; shown: string[] } {
+function formatSearch(lines: string[], pattern: string, glob: string | undefined): string {
   const scope = "/" + pattern + "/" + (glob ? " in " + glob : "");
-  if (lines.length === 0) return { text: "No matches for " + scope, shown: [] };
+  if (lines.length === 0) return "No matches for " + scope;
   const byFile = new Map<string, number>();
   for (const line of lines) {
     const path = line.slice(0, line.indexOf(":"));
@@ -208,20 +220,20 @@ function formatSearch(lines: string[], pattern: string, glob: string | undefined
   const pathOf = (l: string) => l.slice(0, l.indexOf(":"));
   if (lines.length <= MAX_SEARCH_LINES) {
     const ordered = [...lines].sort((a, b) => searchRank(pathOf(a)) - searchRank(pathOf(b)));
-    const text =
+    return (
       lines.length + " matches in " + byFile.size + " files for " + scope + ":\n" +
-      ordered.map((l) => (l.length > SEARCH_MAX_LINE_CHARS ? l.slice(0, SEARCH_MAX_LINE_CHARS) + " [truncated]" : l)).join("\n");
-    return { text, shown: [...byFile.keys()].filter((p) => !isDocPath(p)) };
+      ordered.map((l) => (l.length > SEARCH_MAX_LINE_CHARS ? l.slice(0, SEARCH_MAX_LINE_CHARS) + " [truncated]" : l)).join("\n")
+    );
   }
   const ranked = [...byFile.entries()].sort((a, b) => searchRank(a[0]) - searchRank(b[0]) || b[1] - a[1]);
   const top = ranked.slice(0, MAX_SEARCH_FILES);
-  const text =
+  return (
     lines.length + " matches in " + byFile.size + " files for " + scope + ". Too many to list; matches per file" +
     (ranked.length > top.length ? " (top " + top.length + ")" : "") +
     ":\n" +
     top.map(([path, n]) => path + " (" + n + ")").join("\n") +
-    "\nNarrow the pattern (use identifiers, not words) or add a glob, or read_file one of these paths.";
-  return { text, shown: [] };
+    "\nNarrow the pattern (use identifiers, not words) or add a glob, or read_file one of these paths."
+  );
 }
 
 /**
@@ -260,6 +272,17 @@ async function readText(cwd: string, absolute: string, rel: string): Promise<str
   }
 }
 
+// Line numbers are padded to one width and separated from the text by "│"
+// with no space, so the prefix cannot blend into the indentation. Models were
+// observed copying indented code back at the wrong depth when the prefix was
+// "N: " (the trailing space merges with leading whitespace).
+export const LINE_FORMAT_NOTE = "line│text; everything after │ is exact, including indentation";
+
+export function numberLines(lines: string[], start: number): string {
+  const width = String(start + lines.length - 1).length;
+  return lines.map((l, i) => String(start + i).padStart(width) + "│" + l).join("\n");
+}
+
 async function readFileWindow(cwd: string, path: string, offset: number | undefined, limit: number | undefined): Promise<string> {
   const { absolute, rel } = safePath(cwd, path);
   const text = await readText(cwd, absolute, rel);
@@ -270,26 +293,128 @@ async function readFileWindow(cwd: string, path: string, offset: number | undefi
   if (window.length === 0) {
     return rel + " has " + lines.length + " lines; offset " + start + " is past the end.";
   }
-  const numbered = window.map((l, i) => String(start + i) + ": " + l).join("\n");
-  const bounded = truncateHead(numbered, { maxLines: MAX_OBS_LINES, maxBytes: MAX_OBS_BYTES });
+  const bounded = truncateHead(numberLines(window, start), { maxLines: MAX_OBS_LINES, maxBytes: MAX_OBS_BYTES });
   const shownEnd = start + bounded.outputLines - 1;
-  let out = rel + " lines " + start + "-" + shownEnd + " of " + lines.length + ":\n" + bounded.content;
+  let out = rel + " lines " + start + "-" + shownEnd + " of " + lines.length + " (" + LINE_FORMAT_NOTE + "):\n" + bounded.content;
   if (shownEnd < lines.length) {
     out += "\n[truncated; continue with read_file offset=" + (shownEnd + 1) + " limit=" + MAX_OBS_LINES + "]";
   }
   return out;
 }
 
+const leadingWs = (line: string): string => /^[ \t]*/.exec(line)![0];
+
+/** Re-indent one line of newText by the difference between the model's and the file's indentation. */
+function reindent(line: string, oldIndent: string, fileIndent: string): string {
+  if (!line.trim()) return line;
+  if (line.startsWith(oldIndent)) return fileIndent + line.slice(oldIndent.length);
+  const delta = fileIndent.length - oldIndent.length;
+  if (delta >= 0) return fileIndent.slice(0, delta) + line;
+  const ws = leadingWs(line);
+  return ws.slice(0, Math.max(0, ws.length + delta)) + line.slice(ws.length);
+}
+
+/**
+ * Apply the patch. Exact match first; then a line-by-line match that ignores
+ * leading and trailing whitespace, in which case newText is re-indented by the
+ * same difference. On no match, the error shows the file where oldText's first
+ * line occurs, numbered and exact, so the next attempt has the real text
+ * instead of a second guess (10 of 15 patches failed on this in one run).
+ */
+export function applyPatch(text: string, oldText: string, newText: string, rel: string): { text: string; note: string } {
+  const first = text.indexOf(oldText);
+  if (first !== -1) {
+    if (text.indexOf(oldText, first + oldText.length) !== -1) {
+      throw new Error("oldText matches more than once in " + rel + "; include more surrounding context");
+    }
+    return {
+      text: text.slice(0, first) + newText + text.slice(first + oldText.length),
+      note: "Patched " + rel + " (" + oldText.split("\n").length + " → " + newText.split("\n").length + " lines)",
+    };
+  }
+  const fileLines = text.split("\n");
+  const oldLines = oldText.split("\n");
+  const newLines = newText.split("\n");
+  // A trailing newline in oldText/newText is a line boundary, not a line.
+  if (oldLines.length > 1 && oldLines[oldLines.length - 1] === "") {
+    oldLines.pop();
+    if (newLines[newLines.length - 1] === "") newLines.pop();
+  }
+  const target = oldLines.map((l) => l.trim());
+  const anchorIndex = target.findIndex((l) => l);
+  if (anchorIndex === -1) throw new Error("oldText not found in " + rel + " (it is blank)");
+  const starts: number[] = [];
+  for (let i = 0; i + target.length <= fileLines.length; i++) {
+    let match = true;
+    for (let j = 0; j < target.length && match; j++) match = fileLines[i + j].trim() === target[j];
+    if (match) starts.push(i);
+  }
+  if (starts.length > 1) {
+    throw new Error(
+      "oldText matches at lines " + starts.map((s) => s + 1).join(", ") + " of " + rel +
+        " when indentation is ignored; include more surrounding context",
+    );
+  }
+  if (starts.length === 1) {
+    const start = starts[0];
+    const fileIndent = leadingWs(fileLines[start + anchorIndex]);
+    const oldIndent = leadingWs(oldLines[anchorIndex]);
+    const replacement = newLines.map((l) => reindent(l, oldIndent, fileIndent));
+    const out = [...fileLines.slice(0, start), ...replacement, ...fileLines.slice(start + oldLines.length)].join("\n");
+    return {
+      text: out,
+      note:
+        "Patched " + rel + " lines " + (start + 1) + "-" + (start + oldLines.length) + " (" + oldLines.length + " → " + replacement.length +
+        " lines). Your oldText was indented " + oldIndent.length + " chars, the file " + fileIndent.length +
+        "; newText was re-indented to match. Copy indentation exactly next time.",
+    };
+  }
+  const anchor = target[anchorIndex];
+  const at = fileLines.findIndex((l) => l.trim() === anchor);
+  if (at === -1) {
+    throw new Error(
+      "oldText not found in " + rel + ": no line of the file equals its first line " + JSON.stringify(anchor.slice(0, 100)) +
+        " (compared without indentation). read_file the region and copy the text exactly.",
+    );
+  }
+  const from = Math.max(0, at - anchorIndex);
+  const shown = fileLines.slice(from, Math.min(fileLines.length, from + oldLines.length + 2));
+  throw new Error(
+    "oldText not found in " + rel + ": its first line is at line " + (at + 1) + " but the following lines differ. " +
+      "The file there reads (" + LINE_FORMAT_NOTE + "):\n" + numberLines(shown, from + 1) + "\nUse this exact text as oldText.",
+  );
+}
+
 async function patchFile(cwd: string, path: string, oldText: string, newText: string): Promise<string> {
   const { absolute, rel } = safePath(cwd, path);
   const text = await readText(cwd, absolute, rel);
-  const first = text.indexOf(oldText);
-  if (first === -1) throw new Error("oldText not found in " + rel + "; read the file and copy the exact text");
-  if (text.indexOf(oldText, first + oldText.length) !== -1) {
-    throw new Error("oldText matches more than once in " + rel + "; include more surrounding context");
+  const patched = applyPatch(text, oldText, newText, rel);
+  await writeFile(absolute, patched.text, "utf8");
+  return patched.note;
+}
+
+// Only test/build/lint runs are checks. sed, awk, grep, ls and friends through
+// exec_shell are reads and would otherwise fill `checks` with "sed -n ... | cat -A".
+const CHECK_COMMAND =
+  /\b(bundle|rspec|rake|rails|npm|bun|pnpm|yarn|npx|pytest|jest|vitest|mocha|cargo|go (test|build|vet)|make|mix|dotnet|mvn|gradle|tsc|eslint|rubocop|phpunit|ctest|swift test)\b|--check\b|\bruby -c\b|-m (pytest|unittest)\b/;
+export function isCheckCommand(command: string): boolean {
+  return CHECK_COMMAND.test(command);
+}
+
+// Test runners that exit 0 through a `| tail` still say so in their output.
+const FAILURE_SIGNS = [
+  /\b[1-9]\d* (failures?|failed|errors?|offenses?)\b/i,
+  /\b(FAILED|FAILURES|FAIL)\b/,
+  /Traceback \(most recent call last\)/,
+  /\berror\[E\d+\]/,
+  /\berror TS\d{4}:/,
+];
+/** The first line of output that reports a failure, or undefined. */
+export function reportedFailure(output: string): string | undefined {
+  for (const line of output.split("\n")) {
+    if (FAILURE_SIGNS.some((re) => re.test(line))) return line.trim().slice(0, 160);
   }
-  await writeFile(absolute, text.slice(0, first) + newText + text.slice(first + oldText.length), "utf8");
-  return "Patched " + rel + " (" + oldText.split("\n").length + " → " + newText.split("\n").length + " lines)";
+  return undefined;
 }
 
 /** Execute one action. Never throws: failures become error observations. */
@@ -299,8 +424,9 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
     switch (action.type) {
       case "search_files": {
         const lines = await grepLines(cwd, action.pattern, action.glob, signal);
-        const { text, shown } = formatSearch(lines, action.pattern, action.glob);
-        return { observation: header + boundOutput(text), inspected: shown, kind: lines.length ? "ok" : "empty" };
+        // Matched files are not inspected files: a broad pattern once added 13
+        // schema and migration files the model never opened.
+        return { observation: header + boundOutput(formatSearch(lines, action.pattern, action.glob)), kind: lines.length ? "ok" : "empty" };
       }
       case "read_file": {
         const out = await readFileWindow(cwd, action.path, action.offset, action.limit);
@@ -336,16 +462,20 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
         const note = result.heldOpen
           ? "\n[a background process started by this command is still running and kept its output open; output may be incomplete]"
           : "";
-        const body = "$ " + action.command + "\n" + status + note + "\n" + boundOutput(result.output);
+        const failure = result.code === 0 && !result.timedOut ? reportedFailure(result.output) : undefined;
+        const masked = failure ? " (but the output reports a failure: \"" + failure + "\"; treat this as failed)" : "";
+        const body = "$ " + action.command + "\n" + status + masked + note + "\n" + boundOutput(result.output);
         const lastLine = result.output.trim().split("\n").pop() ?? "";
         return {
           observation: header + body,
           kind: result.output.trim() ? "ok" : "empty",
-          check: {
-            command: action.command.slice(0, 120),
-            code: result.timedOut ? 124 : result.code,
-            summary: (result.timedOut ? "timeout; " : "") + lastLine.slice(0, 160),
-          },
+          check: isCheckCommand(action.command)
+            ? {
+                command: action.command.slice(0, 120),
+                code: result.timedOut ? 124 : result.code,
+                summary: (result.timedOut ? "timeout; " : "") + (failure ? "exit 0 but output reports: " + failure : lastLine.slice(0, 160)),
+              }
+            : undefined,
         };
       }
       case "git_diff": {

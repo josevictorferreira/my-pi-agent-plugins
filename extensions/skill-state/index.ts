@@ -30,7 +30,7 @@ interface ParsedArgs {
 }
 
 /** `/state-run [--skill <path>] [--max-steps N] [--reasoning required|optional] [--no-tools] <objective>` */
-function parseArgs(raw: string): ParsedArgs {
+export function parseArgs(raw: string): ParsedArgs {
   const tokens = raw.trim().split(/\s+/).filter(Boolean);
   const rest: string[] = [];
   let skill: string | undefined;
@@ -51,7 +51,9 @@ function parseArgs(raw: string): ParsedArgs {
     } else if (token === "--no-tools") noTools = true;
     else rest.push(token);
   }
-  return { objective: rest.join(" "), skill, maxSteps, requireReasoning, noTools };
+  // An objective typed in quotes would otherwise carry them into every prompt.
+  const objective = rest.join(" ").replace(/^["'“]([\s\S]*)["'”]$/, "$1").trim();
+  return { objective, skill, maxSteps, requireReasoning, noTools };
 }
 
 /** Extension tools shared through tool-registry.ts, as the runner expects them. */
@@ -71,7 +73,11 @@ function toolRunner(ctx: ExtensionCommandContext): RunOptions["tools"] {
 
 /**
  * Bind the session model to the runner's `complete` contract: auth resolved once
- * per run, optional temperature, no `reasoning` option so provider thinking stays off.
+ * per run, optional temperature, no `reasoning` option. pi-ai sends a provider's
+ * "thinking off" form where it knows one; through a generic OpenAI-compatible
+ * proxy nothing is sent and the model's default applies (glm-5-3 via Velox spent
+ * about five of every six output tokens on hidden reasoning). `usage.reasoning`
+ * records it when the provider reports it.
  */
 async function makeComplete(ctx: ExtensionCommandContext): Promise<CompleteFn> {
   const model = ctx.model;
@@ -93,7 +99,10 @@ async function makeComplete(ctx: ExtensionCommandContext): Promise<CompleteFn> {
       .filter((block) => block.type === "text")
       .map((block) => block.text)
       .join("\n");
-    return { text, usage: { input: reply.usage.input, output: reply.usage.output, cacheRead: reply.usage.cacheRead } };
+    return {
+      text,
+      usage: { input: reply.usage.input, output: reply.usage.output, cacheRead: reply.usage.cacheRead, reasoning: reply.usage.reasoning },
+    };
   };
 }
 
@@ -119,7 +128,8 @@ function resultMessage(summary: RunSummary): string {
   lines.push(
     "Tokens: " +
       (summary.totals.input + summary.totals.output) +
-      " (avg prompt " + summary.avgPromptTokens + ", max " + summary.maxPromptTokens + ")",
+      " (avg prompt " + summary.avgPromptTokens + ", max " + summary.maxPromptTokens +
+      (summary.reasoningTokens ? ", hidden reasoning " + summary.reasoningTokens : "") + ")",
   );
   const text = lines.join("\n");
   return text.length > MAX_RESULT_CHARS ? text.slice(0, MAX_RESULT_CHARS - 1) + "…" : text;
@@ -134,7 +144,8 @@ export default function (pi: ExtensionAPI) {
     let line =
       theme.fg("dim", "state-run ") +
       "step " + t.step + " " + theme.bold(t.status) + " → " + t.actionType +
-      theme.fg("dim", "  prompt " + t.promptBytes + " B, in " + t.input + " / out " + t.output);
+      theme.fg("dim", "  prompt " + t.promptBytes + " B, in " + t.input + " / out " + t.output +
+        (t.reasoningTokens !== undefined ? " (" + t.reasoningTokens + " reasoning)" : ""));
     if (t.retries) line += theme.fg("warning", "  rejected " + t.retries + "x");
     if (t.providerRetries) line += theme.fg("warning", "  provider retries " + t.providerRetries);
     if (expanded) {
@@ -150,7 +161,7 @@ export default function (pi: ExtensionAPI) {
     const rows: Array<[string, string]> = [
       ["status", s.status + (s.outcome ? " (" + s.outcome + ")" : "")],
       ["steps", String(s.steps)],
-      ["tokens in/out", s.totals.input + " / " + s.totals.output],
+      ["tokens in/out", s.totals.input + " / " + s.totals.output + (s.reasoningTokens ? " (hidden reasoning " + s.reasoningTokens + ")" : "")],
       ["prompt tokens avg/max", s.avgPromptTokens + " / " + s.maxPromptTokens],
       ["prompt bytes min/max", s.minPromptBytes + " / " + s.maxPromptBytes],
       ["re-reads", String(s.reReadCount)],

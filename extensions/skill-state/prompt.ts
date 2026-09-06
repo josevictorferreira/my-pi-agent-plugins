@@ -18,7 +18,7 @@ const STATE_RULES =
   '- "state_patch" is merged: send only keys you change. facts/hypotheses merge by key, null deletes; plan/blockers are replaced whole.\n' +
   "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, readsSinceWrite, objective, inspectedFiles, changedFiles, checks.\n" +
   "- Before leaving a file, write what you learned into facts; you will not see this observation again.\n" +
-  "- Limits: facts ≤ 40 (values ≤ 300 chars), hypotheses ≤ 12 (≤ 200 chars), plan/blockers ≤ 15 items, state ≤ 12 KB.\n" +
+  "- Limits: facts ≤ 40 (values ≤ 300 chars; longer values are cut and you are told), hypotheses ≤ 12 (≤ 200 chars, same), plan/blockers ≤ 15 items, state ≤ 12 KB. One idea per key; split long notes across keys.\n" +
   "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 read-only actions between writes; testing needs a changed file. Violations are rejected and you are asked again.";
 
 const RESPONSE_FORMAT =
@@ -61,28 +61,58 @@ export function render(
   return prompt + RESPONSE_FORMAT;
 }
 
-export type ParsedReply = { ok: true; value: unknown } | { ok: false; error: string };
+/** `start` is where the JSON begins in the reply; the text before it is the reasoning. */
+export type ParsedReply = { ok: true; value: unknown; start: number } | { ok: false; error: string };
 
-/** Take the last ```json fenced block; fall back to the whole text as JSON. */
-export function lastFencedJson(text: string): ParsedReply {
-  const fence = /```(?:json)?[ \t]*\r?\n([\s\S]*?)```/g;
-  let last: string | undefined;
-  for (let m = fence.exec(text); m; m = fence.exec(text)) last = m[1];
-  const candidate = (last ?? text).trim();
-  if (!candidate) return { ok: false, error: "no_json_block: reply contained no ```json block" };
-  try {
-    return { ok: true, value: JSON.parse(candidate) };
-  } catch (err) {
-    return {
-      ok: false,
-      error: (last === undefined ? "no_json_block: " : "invalid_json: ") + String((err as Error).message),
-    };
+const NO_BLOCK =
+  "no_json_block: the reply has no ```json block and no JSON object. Write your reasoning, then the fenced block with state_patch and action.";
+
+/** Parse `raw` as JSON, else the widest {...} object inside it (prose around an unfenced block). */
+function parseLoose(raw: string, offset: number, error: string): ParsedReply {
+  const trimmed = raw.trim();
+  if (trimmed) {
+    try {
+      return { ok: true, value: JSON.parse(trimmed), start: offset };
+    } catch {
+      // fall through to the brace scan
+    }
   }
+  const close = raw.lastIndexOf("}");
+  for (let open = raw.indexOf("{"); open !== -1 && open < close; open = raw.indexOf("{", open + 1)) {
+    try {
+      return { ok: true, value: JSON.parse(raw.slice(open, close + 1)), start: offset + open };
+    } catch {
+      // not the outermost brace; try the next one
+    }
+  }
+  return { ok: false, error };
 }
 
-/** Text the model wrote before the last fenced JSON block (its reasoning), trimmed. */
-export function reasoningText(text: string): string {
-  const idx = text.lastIndexOf("```json");
-  const before = idx === -1 ? "" : text.slice(0, idx);
-  return before.trim();
+/**
+ * The last closed ```json block. Failing that, an unclosed ```json opener
+ * (the model stopped before the closing fence) or a bare {...} object after
+ * the reasoning: both shapes were seen carrying complete, valid replies and
+ * cost a full retry each.
+ */
+export function lastFencedJson(text: string): ParsedReply {
+  const fence = /```(?:json)?[ \t]*\r?\n([\s\S]*?)```/g;
+  let last: RegExpExecArray | undefined;
+  for (let m = fence.exec(text); m; m = fence.exec(text)) last = m;
+  if (last) {
+    const body = last[1].trim();
+    if (!body) return { ok: false, error: "no_json_block: the ```json block is empty" };
+    try {
+      return { ok: true, value: JSON.parse(body), start: last.index };
+    } catch (err) {
+      return { ok: false, error: "invalid_json: " + String((err as Error).message) };
+    }
+  }
+  const open = text.lastIndexOf("```json");
+  if (open !== -1) return parseLoose(text.slice(open + 7), open, "invalid_json: the ```json block is not closed and does not parse");
+  return parseLoose(text, 0, NO_BLOCK);
+}
+
+/** Text the model wrote before its JSON (its reasoning), trimmed. */
+export function reasoningText(text: string, jsonStart: number): string {
+  return text.slice(0, jsonStart).trim();
 }

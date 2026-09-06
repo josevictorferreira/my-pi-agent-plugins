@@ -1,7 +1,10 @@
 import type { SkillExecutionState, StatePatch } from "./schemas";
 
-// Bounds enforced after merge (plan §5.2). Exceeding any of them fails the
-// patch and leaves Σt untouched (paper §7 rollback-retry).
+// Bounds enforced after merge (plan §5.2). Exceeding a count or the byte cap
+// fails the patch and leaves Σt untouched (paper §7 rollback-retry). Over-long
+// values are cut instead and reported in the next observation: models cannot
+// count characters, and "value longer than 300 chars" was 14 of 25 rejections
+// in one run, killing it once on three consecutive 301-430 char values.
 // 12 KB / 40 facts: the paper's 6 KB suited shelf and CTF tasks; on source
 // code the state grew ~140 B per step and hit 6 KB around step 40, forcing
 // fact deletion (the "premature overwrite" failure). Still O(1) per step.
@@ -37,46 +40,47 @@ export function serializeState(state: SkillExecutionState): string {
   return JSON.stringify(state);
 }
 
+function clip(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max - 1) + "…" : value;
+}
+
+/** Merge one string map with null-delete, cutting over-long values and noting each cut. */
+function mergeMap(target: Record<string, string>, patch: Record<string, string | null>, field: string, max: number, notices: string[]): void {
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete target[key];
+    else {
+      if (value.length > max) {
+        notices.push(field + "." + key + " was " + value.length + " chars; kept the first " + max + ". Split long notes across keys.");
+      }
+      target[key] = clip(value, max);
+    }
+  }
+}
+
 /** Σ ⊕ ΔΣ: objects merge shallowly with null-delete, lists are replaced whole. */
-function applyPatch(state: SkillExecutionState, patch: StatePatch): SkillExecutionState {
+function applyPatch(state: SkillExecutionState, patch: StatePatch, notices: string[]): SkillExecutionState {
   const next: SkillExecutionState = structuredClone(state);
   if (patch.status !== undefined) next.status = patch.status;
   if (patch.plan !== undefined) next.plan = [...patch.plan];
   if (patch.blockers !== undefined) next.blockers = [...patch.blockers];
-  if (patch.facts) {
-    for (const [key, value] of Object.entries(patch.facts)) {
-      if (value === null) delete next.facts[key];
-      else next.facts[key] = value;
-    }
-  }
-  if (patch.hypotheses) {
-    for (const [key, value] of Object.entries(patch.hypotheses)) {
-      if (value === null) delete next.hypotheses[key];
-      else next.hypotheses[key] = value;
-    }
-  }
+  if (patch.facts) mergeMap(next.facts, patch.facts, "facts", MAX_FACT_VALUE_CHARS, notices);
+  if (patch.hypotheses) mergeMap(next.hypotheses, patch.hypotheses, "hypotheses", MAX_HYPOTHESIS_CHARS, notices);
   return next;
 }
 
 function boundErrors(state: SkillExecutionState): string[] {
   const errors: string[] = [];
   const factKeys = Object.keys(state.facts);
-  if (factKeys.length > MAX_FACTS) errors.push("/facts: more than " + MAX_FACTS + " keys");
+  if (factKeys.length > MAX_FACTS) errors.push("/facts: " + factKeys.length + " keys, limit " + MAX_FACTS + "; delete stale keys with null");
   for (const key of factKeys) {
-    if (key.length > MAX_FACT_KEY_CHARS) errors.push("/facts/" + key + ": key longer than " + MAX_FACT_KEY_CHARS);
-    if (state.facts[key].length > MAX_FACT_VALUE_CHARS) {
-      errors.push("/facts/" + key + ": value longer than " + MAX_FACT_VALUE_CHARS + " chars");
-    }
+    if (key.length > MAX_FACT_KEY_CHARS) errors.push("/facts/" + key + ": key is " + key.length + " chars, limit " + MAX_FACT_KEY_CHARS);
   }
   const hypothesisKeys = Object.keys(state.hypotheses);
-  if (hypothesisKeys.length > MAX_HYPOTHESES) errors.push("/hypotheses: more than " + MAX_HYPOTHESES + " keys");
-  for (const key of hypothesisKeys) {
-    if (state.hypotheses[key].length > MAX_HYPOTHESIS_CHARS) {
-      errors.push("/hypotheses/" + key + ": value longer than " + MAX_HYPOTHESIS_CHARS + " chars");
-    }
+  if (hypothesisKeys.length > MAX_HYPOTHESES) {
+    errors.push("/hypotheses: " + hypothesisKeys.length + " keys, limit " + MAX_HYPOTHESES + "; delete settled ones with null");
   }
-  if (state.plan.length > MAX_LIST_ITEMS) errors.push("/plan: more than " + MAX_LIST_ITEMS + " items");
-  if (state.blockers.length > MAX_LIST_ITEMS) errors.push("/blockers: more than " + MAX_LIST_ITEMS + " items");
+  if (state.plan.length > MAX_LIST_ITEMS) errors.push("/plan: " + state.plan.length + " items, limit " + MAX_LIST_ITEMS);
+  if (state.blockers.length > MAX_LIST_ITEMS) errors.push("/blockers: " + state.blockers.length + " items, limit " + MAX_LIST_ITEMS);
   const bytes = Buffer.byteLength(serializeState(state));
   if (bytes > MAX_STATE_BYTES) {
     errors.push("state is " + bytes + " bytes, limit " + MAX_STATE_BYTES + "; delete or shorten facts");
@@ -84,7 +88,8 @@ function boundErrors(state: SkillExecutionState): string[] {
   return errors;
 }
 
-export type MergeResult = { ok: true; state: SkillExecutionState } | { ok: false; errors: string[] };
+/** `notices` are runtime adjustments the model must hear about (cut values); shown in the next observation. */
+export type MergeResult = { ok: true; state: SkillExecutionState; notices: string[] } | { ok: false; errors: string[] };
 
 /**
  * Phase policy, enforced like any other state bound. Prose rules in the spec
@@ -180,7 +185,8 @@ export function recordAction(state: SkillExecutionState, actionType: string): vo
 
 /** Atomic merge: validate → clone → merge → bound-check → commit or reject. */
 export function merge(state: SkillExecutionState, patch: StatePatch, policy?: PhasePolicy): MergeResult {
-  const next = applyPatch(state, patch);
+  const notices: string[] = [];
+  const next = applyPatch(state, patch, notices);
   if (next.status !== state.status) {
     // Phase bookkeeping is runtime-owned and must be in place before the
     // policies below look at it: the step being decided is state.step + 1, and
@@ -191,7 +197,7 @@ export function merge(state: SkillExecutionState, patch: StatePatch, policy?: Ph
   }
   const errors = boundErrors(next);
   if (policy) errors.push(...phaseErrors(state, next, patch, policy));
-  return errors.length ? { ok: false, errors } : { ok: true, state: next };
+  return errors.length ? { ok: false, errors } : { ok: true, state: next, notices };
 }
 
 // Runtime-owned fields, mutated in place by the runner after each action.

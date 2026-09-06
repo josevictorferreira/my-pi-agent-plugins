@@ -6,7 +6,14 @@ import { actionErrors, createInitialState, merge, recordAction, recordChanged, r
 // Algorithm 1 of the paper: A_t = (P, Σt, Ot) → (Rt, ΔΣt, at); Σt+1 = Σt ⊕ ΔΣt;
 // Ot+1 = env(at). Rt (the reasoning text) is dropped after parsing.
 
+// Rollback-retry budgets per step. "Hard" rejections are malformed or
+// off-schema replies; "soft" ones are state bounds and phase policy, where the
+// reply was fine and the runtime asked for a change. A run died on
+// soft/soft/soft at one step and survived the identical sequence on resume
+// only because the third attempt happened to be a write, so soft rejections
+// get more room.
 const MAX_RETRIES = 2;
+const MAX_SOFT_RETRIES = 4;
 export const DEFAULT_MAX_STEPS = 250;
 // Transient provider failures (proxy 5xx/404, network resets) are retried a
 // few times with backoff before the run is checkpointed and stopped.
@@ -15,7 +22,8 @@ const PROVIDER_BACKOFF_MS = [2000, 8000, 20000];
 
 export interface ModelReply {
   text: string;
-  usage?: { input: number; output: number; cacheRead: number };
+  /** `reasoning` is the hidden-thinking subset of `output`, when the provider reports it. */
+  usage?: { input: number; output: number; cacheRead: number; reasoning?: number };
 }
 
 export type CompleteFn = (prompt: string, signal: AbortSignal) => Promise<ModelReply>;
@@ -45,6 +53,10 @@ export interface StepTelemetry {
   toolName?: string;
   /** Characters of reasoning before the JSON block in the accepted reply. */
   reasoningChars: number;
+  /** Characters of the accepted reply. Compare with `output`: the gap is hidden reasoning. */
+  replyChars: number;
+  /** Hidden reasoning tokens across the step's attempts, when the provider reports them. */
+  reasoningTokens?: number;
 }
 
 export type RunStatus = "completed" | "failed" | "cancelled";
@@ -66,6 +78,7 @@ export interface Checkpoint {
   state: SkillExecutionState;
   observation: string;
   totals: { input: number; output: number; cacheRead: number };
+  reasoningTokens?: number;
   reReadCount: number;
   /** Set when the model itself ended the run with cannot_complete. */
   outcome?: "cannot_complete";
@@ -83,6 +96,8 @@ export interface RunSummary {
   error?: string;
   steps: number;
   totals: { input: number; output: number; cacheRead: number };
+  /** Hidden reasoning tokens (subset of totals.output), when the provider reports them. */
+  reasoningTokens?: number;
   avgPromptTokens: number;
   maxPromptTokens: number;
   minPromptBytes: number;
@@ -166,6 +181,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   let minPromptBytes = Infinity;
   let maxPromptBytes = 0;
   let reReadCount = resume?.reReadCount ?? 0;
+  let reasoningTotal = resume?.reasoningTokens ?? 0;
+  let reasoningReported = resume?.reasoningTokens !== undefined;
   let steps = state.step;
   const firstStep = steps;
   const emit = options.onEvent ?? (() => {});
@@ -183,6 +200,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       maxSteps: options.maxSteps,
       steps,
       totals,
+      reasoningTokens: reasoningReported ? reasoningTotal : undefined,
       avgPromptTokens: own ? Math.round(promptTokenSum / own) : 0,
       maxPromptTokens,
       minPromptBytes: own ? minPromptBytes : 0,
@@ -196,6 +214,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           ? undefined
           : {
               runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount,
+              reasoningTokens: reasoningReported ? reasoningTotal : undefined,
               outcome: extra.outcome === "cannot_complete" ? "cannot_complete" : undefined,
             },
       ...extra,
@@ -209,15 +228,18 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     const step = steps + 1;
     const started = Date.now();
     let retries = 0;
+    let hardRejections = 0;
     let providerRetries = 0;
     const rejections: string[] = [];
     let errors: string[] | undefined;
-    let accepted: { response: StepResponse; next: SkillExecutionState; reasoningChars: number } | undefined;
+    let accepted:
+      | { response: StepResponse; next: SkillExecutionState; notices: string[]; reasoningChars: number; replyChars: number }
+      | undefined;
     let reasoningAsked = false;
     let promptBytes = 0;
     let stateBytes = 0;
     let observationBytes = 0;
-    const usage = { input: 0, output: 0, cacheRead: 0 };
+    const usage = { input: 0, output: 0, cacheRead: 0, reasoning: 0 };
 
     // Rollback-retry: every attempt is a fresh (P, Σt, Ot [+ errors]) prompt.
     while (!accepted) {
@@ -247,10 +269,15 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       usage.input += reply.usage?.input ?? 0;
       usage.output += reply.usage?.output ?? 0;
       usage.cacheRead += reply.usage?.cacheRead ?? 0;
+      if (reply.usage?.reasoning !== undefined) {
+        reasoningReported = true;
+        usage.reasoning += reply.usage.reasoning;
+      }
 
       const parsed = lastFencedJson(reply.text);
       errors = parsed.ok ? validateStepResponse(parsed.value) : [parsed.error];
-      const reasoning = reasoningText(reply.text);
+      let hard = errors.length > 0;
+      const reasoning = parsed.ok ? reasoningText(reply.text, parsed.start) : "";
       if (!errors.length && options.requireReasoning && !reasoning && !reasoningAsked) {
         reasoningAsked = true;
         errors = ["no_reasoning: write your step-by-step reasoning before the ```json block, then the block"];
@@ -259,23 +286,28 @@ export async function run(options: RunOptions): Promise<RunSummary> {
         const response = parsed.value as StepResponse;
         if (response.action.type === "tool") {
           errors = options.tools ? options.tools.validate(response.action.name, response.action.params) : ["/action/type: no extension tools are available in this run"];
+          hard = errors.length > 0;
         }
         if (!errors.length) {
           const merged = merge(state, response.state_patch, { maxSteps: options.maxSteps });
           if (!merged.ok) errors = merged.errors;
           else {
             errors = actionErrors(merged.state, response.action.type);
-            if (!errors.length) accepted = { response, next: merged.state, reasoningChars: reasoning.length };
+            if (!errors.length) {
+              accepted = { response, next: merged.state, notices: merged.notices, reasoningChars: reasoning.length, replyChars: reply.text.length };
+            }
           }
         }
       }
       emit({ type: "attempt", step, attempt: attemptNo, prompt, reply: reply.text, usage: reply.usage, errors: errors ?? [], durationMs: Date.now() - attemptStarted });
       if (!accepted) {
         retries++;
+        if (hard) hardRejections++;
         rejections.push((errors ?? []).join("; ").slice(0, 300));
-        if (retries > MAX_RETRIES) {
+        if (hardRejections > MAX_RETRIES || retries > MAX_SOFT_RETRIES) {
           return finish("failed", {
-            error: "step " + step + ": reply rejected " + retries + " times: " + (errors ?? []).join("; "),
+            error:
+              "step " + step + ": reply rejected " + retries + " times (" + hardRejections + " malformed): " + (errors ?? []).join("; "),
           });
         }
       }
@@ -289,6 +321,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     totals.input += usage.input;
     totals.output += usage.output;
     totals.cacheRead += usage.cacheRead;
+    reasoningTotal += usage.reasoning;
     promptTokenSum += usage.input;
     maxPromptTokens = Math.max(maxPromptTokens, usage.input);
     minPromptBytes = Math.min(minPromptBytes, promptBytes);
@@ -312,7 +345,12 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     for (const path of result.inspected ?? []) recordInspected(state, path);
     if (result.changed) recordChanged(state, result.changed);
     if (result.check) recordCheck(state, result.check);
-    observation = result.observation;
+    // Runtime adjustments to the accepted patch (cut values) go in front of the
+    // observation: the model will not see the rejected-style error, so this is
+    // its only notice.
+    observation = accepted.notices.length
+      ? "Runtime notes:\n" + accepted.notices.map((n) => "- " + n).join("\n") + "\n\n" + result.observation
+      : result.observation;
 
     const telemetry: StepTelemetry = {
       runId,
@@ -323,7 +361,9 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       specBytes,
       stateBytes,
       observationBytes,
-      ...usage,
+      input: usage.input,
+      output: usage.output,
+      cacheRead: usage.cacheRead,
       retries,
       rejections,
       providerRetries,
@@ -333,6 +373,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       observationKind: result.kind,
       toolName: action.type === "tool" ? action.name : undefined,
       reasoningChars: accepted.reasoningChars,
+      replyChars: accepted.replyChars,
+      reasoningTokens: reasoningReported ? usage.reasoning : undefined,
     };
     emit({ type: "step", step, action, statePatch: accepted.response.state_patch, state, observation, telemetry });
     options.onStep(telemetry, state);

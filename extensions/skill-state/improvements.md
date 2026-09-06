@@ -27,7 +27,7 @@ Across all runs, 15 rejections. Grouped:
 | --- | --- | --- |
 | Phase policy (inspect budget, planning limit, read-only streak, plan required) | 6 | Intended; every one was corrected on the next attempt |
 | `hypotheses` value not in the old three-value enum | 1 shown, likely most of the 8 in the pre-fix glyph run | Fixed (free text) |
-| `status` not one of the five allowed values | 3 in one scratch run | Open |
+| `status` not one of the five allowed values | 3 in one scratch run | Fixed (error names the allowed values; rules list them) |
 | `testing` demanded a plan after the model had correctly emptied it | 1 | Fixed |
 | Reply was not JSON at all | 1 | Model fault, retry recovered |
 
@@ -35,7 +35,7 @@ The `status` case matters: the error text is TypeBox's "must be equal to constan
 
 ### 3. Reads that return errors are a large share of inspection
 
-In the glyph runs, 15 of 40 `read_file` observations were under 250 bytes, which at that size can only be an error (missing path, offset past end). That is 37% of file reads producing nothing usable, and it is the main driver of the 7 to 16 re-reads per run. The missing-file listing added today should cut this, but the telemetry does not record whether an action succeeded, so the effect cannot be measured from session entries.
+In the glyph runs, 15 of 40 `read_file` observations were under 250 bytes, which at that size can only be an error (missing path, offset past end). That is 37% of file reads producing nothing usable, and it is the main driver of the 7 to 16 re-reads per run. The missing-file listing added today should cut this. At the time of the analysis telemetry did not record whether an action succeeded; it now does (`actionOk`, `observationKind`), so the effect is measurable from session entries and the log tool marks such steps.
 
 ### 4. Search hits skew towards documentation
 
@@ -67,7 +67,13 @@ In two glyph runs the first plan item was "Find workflow config / fail_fast refe
 
 ## Improvements, ranked by expected value over cost
 
-Status 2026-09-03: all ten implemented (see README for the resulting behaviour). Two further defects were found while verifying them and fixed: the read-only counter carried over from inspection into `editing`, and plan items naming a command mid-sentence ("exec_shell: npm test") were rejected as vague.
+Status 2026-09-03: all ten implemented (see README for the resulting behaviour); typecheck and 108 behavioural checks pass; verified end to end on the scratch fixture (7 steps, 0 rejections) and on the glyph clone (30 steps, 3 policy rejections, dispatcher logic reached for the first time). Two further defects were found while verifying and fixed: the read-only counter carried over from inspection into `editing`, and plan items naming a command mid-sentence ("exec_shell: npm test") were rejected as vague.
+
+What is built but **not yet measured**, because it needs runs that have not been done:
+
+- Item 4 (12 KB state cap): the 30-step glyph run reached 4.7 KB, so the old 6 KB cap would not have bound yet. The comparison needs a run past step 40.
+- Item 8 (`--reasoning required`): the flag and telemetry exist; the A/B comparison of step counts and rejection rates on the glyph objective has not been run.
+- Item 10 (extension tools): the tools appear in the prompt and execute correctly in checks, but in the 30-step glyph run the model never chose a `tool` action, so their effect on inspection is unmeasured. CodeGraph was not available in the clone (no index).
 
 1. **Name the allowed values in rejection errors and rules** (small). Turn "must be equal to constant" into "status must be one of inspecting, planning, editing, testing, repairing" by mapping the TypeBox `enum`/`const` error to the schema's literals, and list the five statuses in the state rules. Removes an avoidable rejection class. (Finding 2)
 
@@ -87,7 +93,7 @@ Status 2026-09-03: all ten implemented (see README for the resulting behaviour).
 
 9. **Trim the fixed prompt** (medium). The built-in spec is 3.3 KB and repeats things the rules say. A 2 KB spec plus 1.5 KB of rules would cut about 500 input tokens per step, roughly 20% of a typical prompt, on providers without caching. Keep the order for prefix caching. (Finding 5)
 
-10. **Give the inspect phase real tools** (large, touches other extensions). `codegraph_explore`, `lsp` and Context7 would replace many of the read and search steps that currently produce errors or documentation hits. Pi exposes the tool catalogue but not execution, so the sibling extensions must export their execute functions through a shared registry. Discussed separately; not started. (Findings 3, 4)
+10. **Give the inspect phase real tools** (large, touches other extensions). `codegraph_explore`, `lsp` and Context7 would replace many of the read and search steps that currently produce errors or documentation hits. Pi exposes the tool catalogue but not execution, so the sibling extensions must export their execute functions through a shared registry. Implemented: `tool-registry.ts` plus a one-line wrapper per read-only tool in the five sibling extensions. (Findings 3, 4)
 
 ## What this data cannot tell you
 

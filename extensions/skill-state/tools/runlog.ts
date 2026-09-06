@@ -68,8 +68,26 @@ const events = readFileSync(path, "utf8")
 
 const stepN = flag("--step") ? Number(flag("--step")) : undefined;
 
+// A resumed run appends to the same log; say where each segment starts.
+function segmentMarker(e: any, previousAt: string | undefined): string | undefined {
+  if (e.type === "run_start" && e.resumedFrom !== undefined) {
+    const gap = previousAt ? Math.round((Date.parse(e.at) - Date.parse(previousAt)) / 60000) : undefined;
+    return "── resumed from step " + e.resumedFrom + " at " + e.at.slice(11, 16) + " UTC" +
+      (gap !== undefined ? " after " + gap + " min" : "") + (e.model ? ", model " + e.model : "") + " ──";
+  }
+  if (e.type === "run_end") {
+    const s = e.summary;
+    return "── run ended at " + e.at.slice(11, 16) + " UTC: " + s.status + (s.outcome ? " (" + s.outcome + ")" : "") + (s.error ? ": " + clip(s.error, 120) : "") + " ──";
+  }
+  return undefined;
+}
+
 if (has("--rejections")) {
+  let previousAt: string | undefined;
   for (const e of events) {
+    const marker = segmentMarker(e, previousAt);
+    if (marker) console.log(marker);
+    previousAt = e.at;
     if (e.type === "attempt" && e.errors.length) {
       console.log("step " + e.step + " attempt " + e.attempt + ":");
       for (const err of e.errors) console.log("  - " + err);
@@ -117,8 +135,13 @@ if (start) {
   console.log("run " + start.runId + (start.model ? "  model " + start.model : "") + "  maxSteps " + start.maxSteps + (start.resumedFrom !== undefined ? "  resumed from step " + start.resumedFrom : ""));
   console.log("objective: " + clip(start.objective, 200) + "\n");
 }
-console.log(pad("step", 5) + pad("status", 11) + pad("action", 13) + rpad("promptB", 8) + rpad("stateB", 7) + rpad("obsB", 6) + rpad("in", 6) + rpad("out", 5) + rpad("rej", 4) + rpad("prov", 5) + rpad("rr", 3) + rpad("ms", 7) + "   detail   (! = action error, - = empty result)");
+console.log(pad("step", 5) + pad("status", 11) + pad("action", 13) + rpad("promptB", 8) + rpad("stateB", 7) + rpad("obsB", 6) + rpad("in", 6) + rpad("out", 6) + rpad("rsn", 6) + rpad("reply", 6) + rpad("rej", 4) + rpad("prov", 5) + rpad("rr", 3) + rpad("ms", 7) + "   detail   (! = action error, - = empty result; rsn = hidden reasoning tokens, reply = chars)");
+const ends = events.filter((e) => e.type === "run_end");
+let previousAt: string | undefined;
 for (const e of events) {
+  const marker = e.type === "run_end" && e === ends[ends.length - 1] ? undefined : segmentMarker(e, previousAt);
+  if (marker) console.log(marker);
+  previousAt = e.at;
   if (e.type !== "step") continue;
   const t = e.telemetry;
   const a = e.action;
@@ -133,10 +156,9 @@ for (const e of events) {
   const mark = t.observationKind === "error" ? "!" : t.observationKind === "empty" ? "-" : " ";
   console.log(
     pad(t.step, 5) + pad(t.status, 11) + pad(a.type, 13) + rpad(t.promptBytes, 8) + rpad(t.stateBytes, 7) + rpad(t.observationBytes, 6) +
-      rpad(t.input, 6) + rpad(t.output, 5) + rpad(t.retries, 4) + rpad(t.providerRetries, 5) + rpad(t.reReadCount, 3) + rpad(t.durationMs, 7) + " " + mark + " " + detail,
+      rpad(t.input, 6) + rpad(t.output, 6) + rpad(t.reasoningTokens ?? "-", 6) + rpad(t.replyChars ?? "-", 6) + rpad(t.retries, 4) + rpad(t.providerRetries, 5) + rpad(t.reReadCount, 3) + rpad(t.durationMs, 7) + " " + mark + " " + detail,
   );
 }
-const ends = events.filter((e) => e.type === "run_end");
 const end = ends[ends.length - 1];
 if (end) {
   const s = end.summary;
