@@ -10,6 +10,7 @@ const DEFAULT_API_URL = "https://velox.josevictor.me";
 const TTS_MODEL = () => process.env.TTS_MODEL || "tts-1";
 const TTS_VOICE = () => process.env.TTS_VOICE || "geffen_32";
 const SUMMARY_MODEL = () => process.env.TTS_SUMMARY_MODEL || "deepseek-v4-flash";
+const AUTO_SPEAK = () => /^(1|true|yes|on)$/i.test(process.env.TTS_AUTO_SPEAK || "");
 
 // /v1/audio/speech rejects input above 4096 chars; stay under it.
 const MAX_SPEECH_CHARS = 4000;
@@ -189,13 +190,15 @@ function play(file: string, signal: AbortSignal): Promise<void> {
 
 // --- Session-scoped run state -----------------------------------------------
 
-let current: { controller: AbortController; file?: string } | undefined;
+let current: { controller: AbortController; file: string } | undefined;
+let runSeq = 0;
 
 function stopCurrent(): void {
   if (!current) return;
   current.controller.abort();
 }
 
+/** Manual trigger: speak the last reply, or stop if already speaking. */
 async function speakLastMessage(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return; // print/json modes: no-op
 
@@ -206,6 +209,17 @@ async function speakLastMessage(ctx: ExtensionContext): Promise<void> {
     return;
   }
 
+  await startSpeaking(ctx);
+}
+
+/** Auto trigger: a new reply supersedes anything still playing. */
+async function autoSpeak(ctx: ExtensionContext): Promise<void> {
+  if (!AUTO_SPEAK() || !ctx.hasUI) return;
+  stopCurrent();
+  await startSpeaking(ctx);
+}
+
+async function startSpeaking(ctx: ExtensionContext): Promise<void> {
   const text = lastAssistantText(ctx);
   if (!text) {
     ctx.ui.notify("tts: no assistant message yet", "warning");
@@ -213,8 +227,10 @@ async function speakLastMessage(ctx: ExtensionContext): Promise<void> {
   }
 
   const controller = new AbortController();
-  const file = join(tmpdir(), "pi-tts-" + process.pid + ".mp3");
-  current = { controller, file };
+  // Unique per run so a superseded run's cleanup can't delete the new file.
+  const file = join(tmpdir(), "pi-tts-" + process.pid + "-" + ++runSeq + ".mp3");
+  const run = { controller, file };
+  current = run;
 
   try {
     ctx.ui.setStatus("tts", "summarizing…");
@@ -233,9 +249,12 @@ async function speakLastMessage(ctx: ExtensionContext): Promise<void> {
       ctx.ui.notify("tts: " + String(err), "error");
     }
   } finally {
-    current = undefined;
     await unlink(file).catch(() => {});
-    ctx.ui.setStatus("tts", undefined);
+    // Only the active run owns the shared state; a superseded run must not clobber it.
+    if (current === run) {
+      current = undefined;
+      ctx.ui.setStatus("tts", undefined);
+    }
   }
 }
 
@@ -249,6 +268,8 @@ export default function (pi: ExtensionAPI) {
     description: "Speak summary of last agent reply",
     handler: (ctx) => speakLastMessage(ctx),
   });
+
+  pi.on("agent_settled", (_event, ctx) => autoSpeak(ctx));
 
   pi.on("session_shutdown", () => stopCurrent());
 }

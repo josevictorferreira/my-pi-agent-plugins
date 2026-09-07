@@ -8,6 +8,9 @@ convenience: no tools, nothing enters the LLM conversation.
 - `/speak` — summarize the last assistant message and speak it. Invoking it
   again while busy stops the current playback.
 - `ctrl+alt+s` — same action.
+- Auto mode: set `TTS_AUTO_SPEAK=1` to speak automatically every time the agent
+  stops (reply finished, question asked, or run aborted). A new reply cuts off
+  any playback still in progress. `/speak` still works as a manual stop.
 
 ## Behavior
 
@@ -29,6 +32,7 @@ convenience: no tools, nothing enters the LLM conversation.
 | `TTS_MODEL` | `tts-1` | speech model alias |
 | `TTS_VOICE` | `geffen_32` | voice |
 | `TTS_SUMMARY_MODEL` | `deepseek-v4-flash` | chat model alias for the summary |
+| `TTS_AUTO_SPEAK` | off | `1`/`true` speaks every reply automatically when the agent stops |
 | `TTS_PLAYER` | auto-detect | explicit player command, e.g. `mpv --no-video --really-quiet` |
 
 ## Player detection
