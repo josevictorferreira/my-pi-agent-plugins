@@ -9,8 +9,9 @@ convenience: no tools, nothing enters the LLM conversation.
   again while busy stops the current playback.
 - `ctrl+alt+s` — same action.
 - Auto mode: set `TTS_AUTO_SPEAK=1` to speak automatically every time the agent
-  stops (reply finished, question asked, or run aborted). A new reply cuts off
-  any playback still in progress. `/speak` still works as a manual stop.
+  stops (reply finished, question asked, or run aborted). A brief chime alert
+  plays right before auto-speaking. A new reply cuts off any playback still in
+  progress. `/speak` still works as a manual stop.
 
 ## Behavior
 
@@ -18,8 +19,11 @@ convenience: no tools, nothing enters the LLM conversation.
 2. Short, code-free replies (≤300 chars) are spoken directly after stripping
    markdown; longer ones are summarized in 2–3 spoken sentences via Velox
    `POST /v1/chat/completions`.
-3. Speech is synthesized with Velox `POST /v1/audio/speech` (mp3), written to a
-   temp file, and played locally. The temp file is removed after playback.
+3. Speech is synthesized with Velox `POST /v1/audio/speech` (mp3), cached
+   in a temp file keyed by the message ID and configuration, and played
+   locally. Re-running `/speak` on the same message reuses the cached audio
+   without making summarization or TTS API calls. Cached files are cleaned up on
+   session shutdown or process exit.
 4. No-op without a UI (print/json modes). Playback is aborted on
    `session_shutdown`.
 
