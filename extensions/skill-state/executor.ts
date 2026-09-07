@@ -30,10 +30,12 @@ export interface ExecutionResult {
   kind: ObservationKind;
   /** Path read by read_file (for inspectedFiles). */
   inspected?: string[];
+  /** Line range a read_file showed (for the open-file windows). */
+  window?: { start: number; end: number; total: number };
   /** Path written by write_file / patch_file (for changedFiles). */
   changed?: string;
-  /** Result of an exec_shell that ran a test, build or lint command (for checks). */
-  check?: { command: string; code: number; summary: string };
+  /** Result of an exec_shell that ran a test, build or lint command (for checks). `ok` is false on a non-zero exit, a timeout, or output that reports a failure. */
+  check?: { command: string; code: number; ok: boolean; summary: string };
 }
 
 interface ShellResult {
@@ -261,7 +263,19 @@ function searchRank(path: string): number {
  */
 function formatSearch(lines: string[], pattern: string, glob: string | undefined): string {
   const scope = "/" + pattern + "/" + (glob ? " in " + glob : "");
-  if (lines.length === 0) return "No matches for " + scope;
+  if (lines.length === 0) {
+    // `*_spec.rb` and `spec/**/*_spec.rb` are file globs, not regexes; runs sent
+    // them for 10+ steps in a row and read every "No matches" as ground truth.
+    // A `*` not preceded by `.` or `]`, a `**`, or a bare path with a slash and
+    // no regex metacharacters: a glob, or a file name.
+    const globLike = /(^|[^.\]])\*/.test(pattern) || pattern.includes("**") || (pattern.includes("/") && !/[\\[|()^$+?]/.test(pattern));
+    return (
+      "No matches for " + scope +
+      (globLike
+        ? ". The pattern is a regex matched against file contents, not a file glob: to find files, use exec_shell with `find . -name '*_spec.rb'` or `ls spec/models`; to find text, search for an identifier that appears in the file."
+        : "")
+    );
+  }
   const byFile = new Map<string, number>();
   for (const line of lines) {
     const path = line.slice(0, line.indexOf(":"));
@@ -333,7 +347,15 @@ export function numberLines(lines: string[], start: number): string {
   return lines.map((l, i) => String(start + i).padStart(width) + "│" + l).join("\n");
 }
 
-async function readFileWindow(cwd: string, path: string, offset: number | undefined, limit: number | undefined): Promise<string> {
+/** A read_file window: the text as shown and the line range it covers. */
+export interface FileWindow {
+  text: string;
+  start: number;
+  end: number;
+  total: number;
+}
+
+export async function readWindow(cwd: string, path: string, offset: number | undefined, limit: number | undefined): Promise<FileWindow> {
   const { absolute, rel } = safePath(cwd, path);
   const text = await readText(cwd, absolute, rel);
   const lines = text.split("\n");
@@ -341,7 +363,7 @@ async function readFileWindow(cwd: string, path: string, offset: number | undefi
   const count = limit ?? MAX_OBS_LINES;
   const window = lines.slice(start - 1, start - 1 + count);
   if (window.length === 0) {
-    return rel + " has " + lines.length + " lines; offset " + start + " is past the end.";
+    return { text: rel + " has " + lines.length + " lines; offset " + start + " is past the end.", start, end: start - 1, total: lines.length };
   }
   const bounded = truncateHead(numberLines(window, start), { maxLines: MAX_OBS_LINES, maxBytes: MAX_OBS_BYTES });
   const shownEnd = start + bounded.outputLines - 1;
@@ -349,7 +371,7 @@ async function readFileWindow(cwd: string, path: string, offset: number | undefi
   if (shownEnd < lines.length) {
     out += "\n[truncated; continue with read_file offset=" + (shownEnd + 1) + " limit=" + MAX_OBS_LINES + "]";
   }
-  return out;
+  return { text: out, start, end: shownEnd, total: lines.length };
 }
 
 const leadingWs = (line: string): string => /^[ \t]*/.exec(line)![0];
@@ -600,8 +622,13 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
         return { observation: header + boundOutput(formatSearch(lines, action.pattern, action.glob)), kind: lines.length ? "ok" : "empty" };
       }
       case "read_file": {
-        const out = await readFileWindow(cwd, action.path, action.offset, action.limit);
-        return { observation: header + out, inspected: [safePath(cwd, action.path).rel], kind: out.includes(" is past the end.") ? "empty" : "ok" };
+        const { text, ...window } = await readWindow(cwd, action.path, action.offset, action.limit);
+        return {
+          observation: header + text,
+          inspected: [safePath(cwd, action.path).rel],
+          window,
+          kind: window.end < window.start ? "empty" : "ok",
+        };
       }
       case "tool": {
         if (!tools || !tools.has(action.name)) throw new Error("no such tool: " + action.name);
@@ -643,6 +670,7 @@ export async function execute(action: RepoAction, cwd: string, signal: AbortSign
             ? {
                 command: action.command.slice(0, 120),
                 code: result.timedOut ? 124 : result.code,
+                ok: !result.timedOut && result.code === 0 && !failure,
                 summary: (result.timedOut ? "timeout; " : "") + (failure ? "exit 0 but output reports: " + failure : checkSummary(result.output)),
               }
             : undefined,

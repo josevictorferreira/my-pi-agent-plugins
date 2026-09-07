@@ -21,7 +21,7 @@ export interface SkillExecutionState {
   objective: string;
   inspectedFiles: string[];
   changedFiles: string[];
-  checks: Array<{ command: string; code: number; summary: string }>;
+  checks: Array<{ command: string; code: number; ok: boolean; summary: string }>;
   // model-owned
   status: Status;
   plan: string[];
@@ -47,29 +47,37 @@ const PATCH_KEYS = new Set(Object.keys(StatePatchSchema.properties));
 const RUNTIME_OWNED = new Set(["version", "step", "statusSince", "readsSinceWrite", "lastWriteStep", "objective", "inspectedFiles", "changedFiles", "checks"]);
 
 /**
- * Move facts the model put directly under `state_patch` into `state_patch.facts`,
- * in place, and return one notice per moved key. `{"state_patch": {"foo": null}}`
- * for "delete fact foo" was 14 of 24 rejections in one run, each a hard one,
- * and the schema error never said where facts belong. Only string/null values
- * under a key that is neither a patch field nor runtime-owned are moved; the
- * rest still fail validation.
+ * Repair two patch shapes in place instead of rejecting them, and return one
+ * notice per repair. Facts the model put directly under `state_patch` are moved
+ * into `state_patch.facts`: `{"state_patch": {"foo": null}}` for "delete fact
+ * foo" was 14 of 24 rejections in one run, each a hard one, and the schema error
+ * never said where facts belong. Only string/null values under a key that is
+ * neither a patch field nor runtime-owned are moved; the rest still fail
+ * validation. Runtime-owned keys (`changedFiles`, `inspectedFiles`, `checks`…)
+ * are dropped: the runtime already tracks them, the model was only narrating
+ * what it did, and one run paid 7 full retries for it.
  */
 export function relocateStrayFacts(value: unknown): string[] {
   if (!value || typeof value !== "object") return [];
   const patch = (value as Record<string, unknown>).state_patch;
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) return [];
   const p = patch as Record<string, unknown>;
-  if (p.facts !== undefined && (!p.facts || typeof p.facts !== "object" || Array.isArray(p.facts))) return [];
+  const notices: string[] = [];
+  const dropped = Object.keys(p).filter((key) => RUNTIME_OWNED.has(key));
+  for (const key of dropped) delete p[key];
+  if (dropped.length) notices.push("state_patch." + dropped.join(", state_patch.") + " ignored: runtime-owned, the runtime tracks it.");
+  if (p.facts !== undefined && (!p.facts || typeof p.facts !== "object" || Array.isArray(p.facts))) return notices;
   const moved: string[] = [];
   for (const [key, v] of Object.entries(p)) {
-    if (PATCH_KEYS.has(key) || RUNTIME_OWNED.has(key)) continue;
+    if (PATCH_KEYS.has(key)) continue;
     if (v !== null && typeof v !== "string") continue;
     const facts = (p.facts ??= {}) as Record<string, unknown>;
     if (!(key in facts)) facts[key] = v;
     delete p[key];
     moved.push(key);
   }
-  return moved.length ? ["state_patch." + moved.join(", state_patch.") + " moved into facts: facts belong under state_patch.facts.<key> (null there deletes)."] : [];
+  if (moved.length) notices.push("state_patch." + moved.join(", state_patch.") + " moved into facts: facts belong under state_patch.facts.<key> (null there deletes).");
+  return notices;
 }
 
 const strict = { additionalProperties: false } as const;
@@ -83,7 +91,8 @@ export const RepoActionSchema = Type.Union([
     {
       type: Type.Literal("read_file"),
       path: Type.String(),
-      offset: Type.Optional(Type.Integer({ minimum: 1 })),
+      // 0 is accepted and read as 1: a rejection over it cost a retry for nothing.
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
       limit: Type.Optional(Type.Integer({ minimum: 1 })),
     },
     strict,

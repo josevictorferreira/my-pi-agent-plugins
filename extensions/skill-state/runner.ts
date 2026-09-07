@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { execute, type ObservationKind, type ToolRunner } from "./executor";
+import { covers, noteOpen, renderOpenFiles, type OpenWindow } from "./openfiles";
 import { lastFencedJson, reasoningText, render, type RenderedPrompt } from "./prompt";
 import { relocateStrayFacts, validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
 import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
@@ -45,6 +46,8 @@ export interface StepTelemetry {
   specBytes: number;
   stateBytes: number;
   observationBytes: number;
+  /** Bytes of the open-file text shown alongside the observation. */
+  openBytes: number;
   input: number;
   output: number;
   cacheRead: number;
@@ -118,6 +121,8 @@ export interface Checkpoint {
   maxSteps: number;
   state: SkillExecutionState;
   observation: string;
+  /** Files whose current text is shown with every prompt (openfiles.ts). */
+  openFiles?: OpenWindow[];
   totals: { input: number; output: number; cacheRead: number };
   reasoningTokens?: number;
   reReadCount: number;
@@ -366,6 +371,21 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   // Path of a patch_file that failed on the previous step, if any.
   let lastFailedPatch: string | undefined;
   let discardedSteps = 0;
+  // Files the model read or wrote last, shown with their current text in every
+  // prompt (openfiles.ts). `latestRead` is the one whose text is already the
+  // latest observation, so it is not shown twice.
+  const open: OpenWindow[] = resume?.openFiles ? structuredClone(resume.openFiles) : [];
+  let latestRead: OpenWindow | undefined;
+  const relPath = (path: string): string => relative(cwd, resolve(cwd, path));
+  // The last test/build/lint command and how it went, for the finish guard, and
+  // the last one with no file argument (the whole suite): a run that has run the
+  // whole suite must run it again after its last edit, not a single spec file.
+  // Neither is in the checkpoint: a resumed run has to run its checks again
+  // before it may claim completion.
+  let lastCheck: { step: number; command: string; ok: boolean } | undefined;
+  let lastFullCheck: typeof lastCheck;
+  const targeted = (command: string): boolean =>
+    command.split(/\s+/).some((t) => !t.startsWith("-") && (t.includes("/") || /\.[a-z]{1,5}$/i.test(t)));
 
   const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => {
     const own = steps - firstStep;
@@ -393,7 +413,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
         status === "completed"
           ? undefined
           : {
-              runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount,
+              runId, objective, spec, maxSteps: options.maxSteps, state, observation, openFiles: open, totals, reReadCount,
               elapsedMs, actions, failedActions,
               reasoningTokens: reasoningReported ? reasoningTotal : undefined,
               outcome: extra.outcome === "cannot_complete" ? "cannot_complete" : undefined,
@@ -423,10 +443,14 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     const usage = { input: 0, output: 0, cacheRead: 0, reasoning: 0 };
 
     let discarded = false;
+    // Re-read from disk once per step, so an edit made last step is what the model sees now.
+    const openView = await renderOpenFiles(cwd, open, latestRead);
+    const openBytes = Buffer.byteLength(openView.text);
+    const shownWindows = latestRead ? [latestRead, ...openView.shown] : openView.shown;
 
     // Rollback-retry: every attempt is a fresh (P, Σt, Ot [+ errors]) prompt.
     while (!accepted && !discarded) {
-      const prompt = render(spec, state, observation, options.maxSteps, errors, options.tools?.vocabulary);
+      const prompt = render(spec, state, observation, options.maxSteps, errors, options.tools?.vocabulary, openView.text || undefined);
       promptBytes = Buffer.byteLength(prompt.system) + Buffer.byteLength(prompt.user);
       stateBytes = Buffer.byteLength(serializeState(state));
       observationBytes = Buffer.byteLength(observation);
@@ -478,6 +502,41 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           if (!merged.ok) errors = merged.errors;
           else {
             errors = actionErrors(merged.state, response.action);
+            if (!errors.length && response.action.type === "read_file") {
+              // The text is in the prompt already; a read would spend a step to
+              // show the same bytes again (22 of one run's 54 steps did that).
+              const wanted = { path: relPath(response.action.path), offset: response.action.offset, limit: response.action.limit };
+              const shown = shownWindows.find((w) => covers(w, wanted));
+              if (shown) {
+                errors = [
+                  "/action: " + shown.path + " lines " + shown.start + "-" + shown.end + " are already in front of you with their current text (" +
+                    (shown === latestRead ? "the latest observation" : "under Open files") + "), unchanged since step " + shown.step +
+                    ". Do not read them again: patch_file the file copying oldText from that text, read lines outside that range or another file, or run a check.",
+                ];
+              }
+            }
+            if (!errors.length && response.action.type === "finish" && response.action.outcome === "completed") {
+              // "completed" is a claim about the checks, so the checks have to
+              // back it: one run finished "completed" at step 3 having changed
+              // nothing, another with 13 of 14 failures still failing.
+              const decisive = lastFullCheck ?? lastCheck;
+              const label = (lastFullCheck ? "whole-suite check" : "check") + (decisive ? " (`" + decisive.command + "`, step " + decisive.step + ")" : "");
+              const reason = !merged.state.changedFiles.length
+                ? "no file has been changed"
+                : !decisive
+                  ? "no test, build or lint command has run"
+                  : decisive.step <= merged.state.lastWriteStep
+                    ? "the last " + label + " ran before the last file change at step " + merged.state.lastWriteStep + "; run it again"
+                    : !decisive.ok
+                      ? "the last " + label + " failed"
+                      : undefined;
+              if (reason) {
+                errors = [
+                  '/action: finish with outcome "completed" needs a passing check after the last file change, but ' + reason +
+                    '. Run the project\'s checks (the whole suite, not one file) and finish when they pass, or finish with "cannot_complete" and say what remains.',
+                ];
+              }
+            }
             const repeat = errors.length ? undefined : await repeatedFailedWrite(failedWrites, response.action, cwd);
             if (repeat) {
               errors = [
@@ -554,7 +613,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     }
     recordAction(state, action.type, result.changed !== undefined);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
-    if (action.type === "read_file" || action.type === "search_files") {
+    if (action.type === "read_file" || action.type === "search_files" || action.type === "exec_shell") {
       const key = JSON.stringify(action);
       const earlier = seenReads.get(key);
       if (earlier !== undefined) {
@@ -565,8 +624,13 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           (action.type === "read_file" && lastFailedPatch === action.path
             ? "Note: this exact action already ran at step " + earlier +
               ". Your last patch on this file failed: the text below is the file, copy oldText from it character for character, do not retype it from facts.\n"
-            : "Note: this exact action already ran at step " + earlier + " and nothing changed since. " +
-              "Record what you need in facts instead of repeating it.\n") + result.observation;
+            : action.type === "exec_shell"
+              // One run ran the same mistyped rspec path three times and read the
+              // repeated error as "the spec file does not exist".
+              ? "Note: this exact command already ran at step " + earlier + " and no file changed since, so its result is the same. " +
+                "If it is not what you expected, the command itself is what to change.\n"
+              : "Note: this exact action already ran at step " + earlier + " and nothing changed since. " +
+                "Record what you need in facts instead of repeating it.\n") + result.observation;
       }
       seenReads.set(key, step);
     } else if (result.changed) {
@@ -583,9 +647,20 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       }
     }
     lastFailedPatch = action.type === "patch_file" && !result.changed ? action.path : undefined;
+    latestRead = undefined;
+    if (action.type === "read_file" && result.kind === "ok" && result.inspected?.length && result.window) {
+      noteOpen(open, result.inspected[0], step, { offset: action.offset, limit: action.limit, ...result.window });
+      latestRead = open[0];
+    } else if (result.changed) {
+      noteOpen(open, result.changed, step);
+    }
     for (const path of result.inspected ?? []) recordInspected(state, path);
     if (result.changed) recordChanged(state, result.changed);
-    if (result.check) recordCheck(state, result.check);
+    if (result.check) {
+      recordCheck(state, result.check);
+      lastCheck = { step, command: result.check.command, ok: result.check.ok };
+      if (!targeted(result.check.command)) lastFullCheck = lastCheck;
+    }
     // Runtime adjustments to the accepted patch (cut values) go in front of the
     // observation: the model will not see the rejected-style error, so this is
     // its only notice.
@@ -602,6 +677,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       specBytes,
       stateBytes,
       observationBytes,
+      openBytes,
       input: usage.input,
       output: usage.output,
       cacheRead: usage.cacheRead,

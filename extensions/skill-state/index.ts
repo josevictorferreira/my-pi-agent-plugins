@@ -1,12 +1,12 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { complete } from "@earendil-works/pi-ai/compat";
 import { Text } from "@earendil-works/pi-tui";
+import { bindModel } from "./model";
 import { DEFAULT_MAX_STEPS, run, type Checkpoint, type CompleteFn, type RunOptions, type RunSummary, type StepProgress, type StepTelemetry } from "./runner";
 import type { SkillExecutionState } from "./schemas";
 import { listCheckpoints, loadCheckpoint, removeCheckpoint, saveCheckpoint } from "./checkpoints";
 import { listRunLogs, openRunLog, runLogDir } from "./runlog";
 import { hasStateRunTool, listStateRunTools, runStateRunTool, validateToolParams } from "./tool-registry";
-import { loadSpec } from "./workflow";
+import { expandObjective, loadSpec } from "./workflow";
 
 const MAX_RESULT_CHARS = 1024;
 
@@ -78,17 +78,12 @@ function toolRunner(ctx: ExtensionCommandContext): RunOptions["tools"] {
 }
 
 /**
- * Bind the session model to the runner's `complete` contract: auth resolved once
- * per run, optional temperature, no `reasoning` option. pi-ai sends a provider's
- * "thinking off" form where it knows one; through a generic OpenAI-compatible
- * proxy nothing is sent and the model's default applies (glm-5-3 via Velox spent
- * about five of every six output tokens on hidden reasoning). `usage.reasoning`
- * records it when the provider reports it.
- *
- * The spec, action vocabulary and state rules go in the system prompt and the
- * run id is the cache session key, so the 4 KB that never change between steps
- * can be served from the provider's prompt cache (`cacheRead` was 0 for every
- * one of a run's 372 calls).
+ * Bind the session model to the runner's `complete` contract (model.ts): auth
+ * resolved once per run, optional temperature, and the session's thinking level
+ * (`/thinking`). With no level, or "off", the run asks for no provider thinking:
+ * reasoning is meant to be textual, as in the paper's Appendix A.4, and hidden
+ * reasoning was 90 % of one run's output tokens. `usage.reasoning` records
+ * whatever the provider still reports.
  */
 async function makeComplete(ctx: ExtensionCommandContext, runId: string): Promise<CompleteFn> {
   const model = ctx.model;
@@ -96,25 +91,7 @@ async function makeComplete(ctx: ExtensionCommandContext, runId: string): Promis
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) throw new Error(auth.error);
   const target = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
-  const temperature = configuredTemperature();
-  return async (prompt, signal) => {
-    const reply = await complete(
-      target,
-      { systemPrompt: prompt.system, messages: [{ role: "user", content: prompt.user, timestamp: Date.now() }] },
-      { apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal, temperature, cacheRetention: "long", sessionId: runId },
-    );
-    if (reply.stopReason === "error" || reply.stopReason === "aborted") {
-      throw new Error(reply.errorMessage || reply.stopReason);
-    }
-    const text = reply.content
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join("\n");
-    return {
-      text,
-      usage: { input: reply.usage.input, output: reply.usage.output, cacheRead: reply.usage.cacheRead, reasoning: reply.usage.reasoning },
-    };
-  };
+  return bindModel(target, auth, { runId, thinking: ctx.thinkingLevel ?? "off", temperature: configuredTemperature() });
 }
 
 const clip = (text: string, max: number): string => (text.length > max ? text.slice(0, max - 1) + "…" : text);
@@ -244,7 +221,7 @@ export default function (pi: ExtensionAPI) {
       const preview = (t.observationPreview ?? "").split("\n").slice(t.resultLine ? 1 : 0);
       if (preview.length) line += "\n" + preview.map((l) => theme.fg("toolOutput", "  │ " + l)).join("\n");
       line += "\n" + theme.fg("dim",
-        "  prompt " + t.promptBytes + " B (state " + t.stateBytes + ", observation " + t.observationBytes + "), reply " +
+        "  prompt " + t.promptBytes + " B (state " + t.stateBytes + ", observation " + t.observationBytes + ", open files " + (t.openBytes ?? 0) + "), reply " +
         t.replyChars + " chars" + (t.reasoningTokens ? ", " + tokens(t.reasoningTokens) + " hidden reasoning" : "") +
         (t.cacheRead ? ", " + tokens(t.cacheRead) + " cached" : "") + ", re-reads " + t.reReadCount);
     }
@@ -408,7 +385,7 @@ export default function (pi: ExtensionAPI) {
       }
       await launch(ctx, {
         runId: "sr-" + Date.now().toString(36),
-        objective: parsed.objective,
+        objective: await expandObjective(parsed.objective, ctx.cwd),
         spec,
         maxSteps: parsed.maxSteps,
         requireReasoning: parsed.requireReasoning,
