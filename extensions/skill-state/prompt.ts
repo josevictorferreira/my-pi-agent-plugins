@@ -22,8 +22,8 @@ const STATE_RULES =
   '- "state_patch" is merged: send only keys you change. facts/hypotheses merge by key, null deletes; plan/blockers are replaced whole.\n' +
   "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, readsSinceWrite, lastWriteStep, objective, inspectedFiles, changedFiles, checks.\n" +
   "- Before leaving a file, write what you learned into facts; you will not see this observation again.\n" +
-  "- Limits: facts ≤ 40 (values ≤ 600 chars; a longer value is cut, marked \" [CUT]\" and is no longer exact text), hypotheses ≤ 12 (≤ 200 chars, same), plan/blockers ≤ 15 items, state ≤ 12 KB. One idea per key; split long notes across keys.\n" +
-  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 actions that change nothing between writes (a rejected patch is one of them); editing and repairing end after 12 steps without a file change; testing needs a changed file. Violations are rejected and you are asked again.";
+  "- Limits: facts ≤ 40 (over that the oldest are dropped; values ≤ 600 chars; a longer value is cut, marked \" [CUT]\" and is no longer exact text), hypotheses ≤ 12 (≤ 200 chars, same), plan/blockers ≤ 15 items, state ≤ 12 KB. One idea per key; split long notes across keys.\n" +
+  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 actions that change nothing between writes (a rejected patch is one of them; exec_shell is not); editing and repairing end after 12 steps without a file change; testing needs a changed file. Violations are rejected and you are asked again.";
 
 const RESPONSE_FORMAT =
   "Provide your response with:\n" +

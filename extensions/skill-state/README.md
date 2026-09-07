@@ -46,7 +46,7 @@ prompt size is independent of the step count and cumulative tokens grow linearly
   - after a third of the budget, and never later than step 30, a patch that leaves `status` at `inspecting` is rejected;
   - `planning` requires a non-empty `plan` and lasts at most 2 steps, then `status` must be `editing`, entered with a plan (items are removed as they are done, so the plan may be empty later);
   - every plan item must name a file (a path or `name.ext`) or a command to run; "search for X" is inspection, not a plan;
-  - in `editing`, after 3 actions that changed no file (`read_file`, `search_files`, `exec_shell`, `git_diff`, `tool`, **and a rejected `write_file`/`patch_file`**), the next action must be a write or `finish`; the counter starts at zero when `editing` is entered and is reset only by a write that actually changed a file (counting failed writes as writes disabled this guard entirely: `read_file → failed patch_file → …` reset it every other step, and it fired once in 346 steps);
+  - in `editing`, after 3 actions that changed no file (`read_file`, `search_files`, `git_diff`, `tool`, **and a rejected `write_file`/`patch_file`**), the next action must be a write or `finish`; the counter starts at zero when `editing` is entered and is reset only by a write that actually changed a file (counting failed writes as writes disabled this guard entirely: `read_file → failed patch_file → …` reset it every other step, and it fired once in 346 steps). `exec_shell` does not count: running the checks after an edit is what the phase is for, and `read → read → rspec` tripped the gate on a run that then needed to re-read the one file its next edit touched. At the gate one `read_file` of the file named in the first plan item is still allowed, since the model cannot see the observation it read it in;
   - `editing` and `repairing` end after 12 steps in which no file changed: the reply is rejected until the model changes phase or sends `finish`. One run spent 138 consecutive steps in `editing` re-sending a patch that could not apply, and nothing capped it. `testing` is exempt, since its steps are meant to change nothing;
   - `testing` requires at least one changed file.
   The runtime tracks this in three runtime-owned state fields, `statusSince`, `readsSinceWrite` and `lastWriteStep`, which the model sees but cannot patch.
@@ -91,13 +91,21 @@ model-owned:   status, plan[], hypotheses{} (short free text), facts{}, blockers
 Merge semantics (stated in the prompt): `facts` and `hypotheses` merge by key
 and `null` deletes; `plan` and `blockers` are replaced whole; patching a
 runtime-owned key is a validation error that names the key. Bounds after merge:
-40 facts, 12 hypotheses, 15 plan/blocker items, 12 KB total, plus the phase rules above. The paper's 6 KB suited its shelf and CTF schemas; on source code the state grew about 140 bytes per step and hit 6 KB around step 40.
+12 hypotheses, 15 plan/blocker items, 12 KB total, plus the phase rules above. The paper's 6 KB suited its shelf and CTF schemas; on source code the state grew about 140 bytes per step and hit 6 KB around step 40.
+Facts are capped at 40 keys, but going over is not a rejection either: the oldest keys not written by the patch are dropped (key order is recency; rewriting a key refreshes it) and the "Runtime notes" line names them. At the cap every new fact needed a deletion in the same patch, and one run spent 8 of its last 10 attempts failing that.
+A fact sent directly under `state_patch` instead of `state_patch.facts` (`{"state_patch": {"foo": null}}` for "delete foo") is moved into `facts` with a note rather than rejected; that shape was 14 of 24 rejections in one run. Runtime-owned keys and non-string values are still errors, and the error now says where facts belong.
 Fact values are capped at 600 chars and hypotheses at 200, but an over-long value is cut, not rejected: the patch is accepted and the next observation opens with a "Runtime notes" line naming the key and its length. Models cannot count characters, and "value longer than 300 chars" was 14 of 25 rejections in one run. The cut is also marked in the value itself with ` [CUT]`, and the cap was raised from 300: at 300 a run split one 99-character source line across six keys, and a `…` at the end of a code fragment reads as prose, not as "this is no longer exact text" — it then patched from the cut value.
 An invalid or over-bound reply is rejected, the state is left untouched, and the
 same `(P, Σt, Ot)` prompt is re-sent with the error list appended (rollback-retry,
 paper §7). Malformed or off-schema replies ("hard") get 3 attempts per step; bound
 and phase-policy rejections ("soft", the reply was fine and the runtime asked for
-a change) get 5. Exceeding either fails the run and checkpoints it.
+a change) get 5, counted separately (hard rejections used to eat the soft budget too,
+and soft/hard/hard/soft/soft ended a run). Exceeding either **discards the step**:
+Σ is kept, the step is spent, and the next observation lists every rejection the
+attempts got so the model can satisfy all of them at once. The log records it as a
+`discarded_step` event. After 3 discarded steps in one run the run fails and is
+checkpointed; before that change a single exhausted step killed a run at step 67 of
+500 with 4 failing tests left and a one-line fix next.
 
 ## Debugging a run: the per-run log
 
@@ -108,6 +116,7 @@ Every run writes a JSONL trace to `~/.pi/agent/skill-state/<working-directory>/l
 | `run_start` | run id, objective, budget, model, spec, cwd, `resumedFrom` |
 | `attempt` | one per model call that returned: full prompt, raw reply (with the discarded reasoning), usage, validation/merge errors (empty when accepted), duration |
 | `provider_error` | one per failed model call: attempt number, error, duration |
+| `discarded_step` | a step whose retries ran out: retries, hard rejections, last errors, usage; the state was kept |
 | `step` | committed step: action, `state_patch`, state after merge, observation, telemetry (including `actionOk`, `observationKind`, `toolName`, `reasoningChars`) |
 | `run_end` | the run summary |
 

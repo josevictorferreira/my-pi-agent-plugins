@@ -14,7 +14,7 @@ export interface SkillExecutionState {
   step: number;
   /** Step at which `status` last changed (phase budgets are measured from here). */
   statusSince: number;
-  /** Actions taken since the last write that changed a file (failed writes count). */
+  /** Reads, searches and failed writes since the last write that changed a file (exec_shell does not count). */
   readsSinceWrite: number;
   /** Step at which a file last actually changed; 0 when nothing has changed yet. */
   lastWriteStep: number;
@@ -42,6 +42,35 @@ export const StatePatchSchema = Type.Object(
   { additionalProperties: false },
 );
 export type StatePatch = Static<typeof StatePatchSchema>;
+
+const PATCH_KEYS = new Set(Object.keys(StatePatchSchema.properties));
+const RUNTIME_OWNED = new Set(["version", "step", "statusSince", "readsSinceWrite", "lastWriteStep", "objective", "inspectedFiles", "changedFiles", "checks"]);
+
+/**
+ * Move facts the model put directly under `state_patch` into `state_patch.facts`,
+ * in place, and return one notice per moved key. `{"state_patch": {"foo": null}}`
+ * for "delete fact foo" was 14 of 24 rejections in one run, each a hard one,
+ * and the schema error never said where facts belong. Only string/null values
+ * under a key that is neither a patch field nor runtime-owned are moved; the
+ * rest still fail validation.
+ */
+export function relocateStrayFacts(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const patch = (value as Record<string, unknown>).state_patch;
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) return [];
+  const p = patch as Record<string, unknown>;
+  if (p.facts !== undefined && (!p.facts || typeof p.facts !== "object" || Array.isArray(p.facts))) return [];
+  const moved: string[] = [];
+  for (const [key, v] of Object.entries(p)) {
+    if (PATCH_KEYS.has(key) || RUNTIME_OWNED.has(key)) continue;
+    if (v !== null && typeof v !== "string") continue;
+    const facts = (p.facts ??= {}) as Record<string, unknown>;
+    if (!(key in facts)) facts[key] = v;
+    delete p[key];
+    moved.push(key);
+  }
+  return moved.length ? ["state_patch." + moved.join(", state_patch.") + " moved into facts: facts belong under state_patch.facts.<key> (null there deletes)."] : [];
+}
 
 const strict = { additionalProperties: false } as const;
 
@@ -104,7 +133,10 @@ const ACTION_BRANCHES = new Map<string, TSchema>(
 
 function describe(prefix: string, e: { instancePath: string; keyword: string; message: string; params: any }): string {
   const path = prefix + (e.instancePath || "");
-  if (e.keyword === "additionalProperties") return path + ": unknown or runtime-owned keys: " + e.params.additionalProperties.join(", ");
+  if (e.keyword === "additionalProperties") {
+    return path + ": unknown or runtime-owned keys: " + e.params.additionalProperties.join(", ") +
+      (path === "/state_patch" ? " (facts belong under /state_patch/facts/<key>)" : "");
+  }
   if (path === "/state_patch/status") return path + ": must be one of " + STATUSES.join(", ");
   return path + ": " + e.message;
 }

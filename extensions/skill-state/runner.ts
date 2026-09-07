@@ -2,7 +2,7 @@ import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { execute, type ObservationKind, type ToolRunner } from "./executor";
 import { lastFencedJson, reasoningText, render, type RenderedPrompt } from "./prompt";
-import { validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
+import { relocateStrayFacts, validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
 import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
 
 // Algorithm 1 of the paper: A_t = (P, Σt, Ot) → (Rt, ΔΣt, at); Σt+1 = Σt ⊕ ΔΣt;
@@ -13,9 +13,15 @@ import { actionErrors, createInitialState, merge, recordAction, recordChanged, r
 // reply was fine and the runtime asked for a change. A run died on
 // soft/soft/soft at one step and survived the identical sequence on resume
 // only because the third attempt happened to be a write, so soft rejections
-// get more room.
+// get more room. The two budgets are independent: counting hard rejections
+// against the soft budget too killed a run at soft/hard/hard/soft/soft.
 const MAX_RETRIES = 2;
 const MAX_SOFT_RETRIES = 4;
+// Exhausting a step's retries discards that step (the model is told so and the
+// step is spent) instead of ending the run: one died at step 67 of 500 with 4
+// failing tests left, the next fix a one-line association. Only this many
+// discarded steps per run; the stall guards bound the loop in between.
+const MAX_DISCARDED_STEPS = 3;
 export const DEFAULT_MAX_STEPS = 250;
 // Transient provider failures (proxy 5xx/404, network resets) are retried a
 // few times with backoff before the run is checkpointed and stopped.
@@ -100,6 +106,7 @@ export type RunEvent =
   | { type: "run_start"; runId: string; objective: string; maxSteps: number; resumedFrom?: number; spec: string; cwd: string; model?: string }
   | { type: "attempt"; step: number; attempt: number; prompt: string; reply: string; usage?: ModelReply["usage"]; errors: string[]; durationMs: number }
   | { type: "provider_error"; step: number; attempt: number; error: string; durationMs: number }
+  | { type: "discarded_step"; step: number; retries: number; hardRejections: number; errors: string[]; usage: { input: number; output: number; cacheRead: number; reasoning: number } }
   | { type: "step"; step: number; action: RepoAction; statePatch: StatePatch; state: SkillExecutionState; observation: string; telemetry: StepTelemetry }
   | { type: "run_end"; summary: RunSummary };
 
@@ -345,6 +352,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   const failedWrites = new Map<string, FailedWrite>();
   // Path of a patch_file that failed on the previous step, if any.
   let lastFailedPatch: string | undefined;
+  let discardedSteps = 0;
 
   const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => {
     const own = steps - firstStep;
@@ -396,8 +404,10 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     let observationBytes = 0;
     const usage = { input: 0, output: 0, cacheRead: 0, reasoning: 0 };
 
+    let discarded = false;
+
     // Rollback-retry: every attempt is a fresh (P, Σt, Ot [+ errors]) prompt.
-    while (!accepted) {
+    while (!accepted && !discarded) {
       const prompt = render(spec, state, observation, options.maxSteps, errors, options.tools?.vocabulary);
       promptBytes = Buffer.byteLength(prompt.system) + Buffer.byteLength(prompt.user);
       stateBytes = Buffer.byteLength(serializeState(state));
@@ -431,6 +441,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       }
 
       const parsed = lastFencedJson(reply.text);
+      const relocated = parsed.ok ? relocateStrayFacts(parsed.value) : [];
       errors = parsed.ok ? validateStepResponse(parsed.value) : [parsed.error];
       let hard = errors.length > 0;
       const reasoning = parsed.ok ? reasoningText(reply.text, parsed.start) : "";
@@ -448,7 +459,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           const merged = merge(state, response.state_patch, { maxSteps: options.maxSteps });
           if (!merged.ok) errors = merged.errors;
           else {
-            errors = actionErrors(merged.state, response.action.type);
+            errors = actionErrors(merged.state, response.action);
             const repeat = errors.length ? undefined : await repeatedFailedWrite(failedWrites, response.action, cwd);
             if (repeat) {
               errors = [
@@ -459,7 +470,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
               hard = true;
             }
             if (!errors.length) {
-              accepted = { response, next: merged.state, notices: merged.notices, reasoning, replyChars: reply.text.length };
+              accepted = { response, next: merged.state, notices: [...relocated, ...merged.notices], reasoning, replyChars: reply.text.length };
             }
           }
         }
@@ -469,13 +480,33 @@ export async function run(options: RunOptions): Promise<RunSummary> {
         retries++;
         if (hard) hardRejections++;
         rejections.push((errors ?? []).join("; ").slice(0, 300));
-        if (hardRejections > MAX_RETRIES || retries > MAX_SOFT_RETRIES) {
-          return finish("failed", {
-            error:
-              "step " + step + ": reply rejected " + retries + " times (" + hardRejections + " malformed): " + (errors ?? []).join("; "),
-          });
+        if (hardRejections > MAX_RETRIES || retries - hardRejections > MAX_SOFT_RETRIES) {
+          const reason = "reply rejected " + retries + " times (" + hardRejections + " malformed): " + (errors ?? []).join("; ");
+          if (++discardedSteps > MAX_DISCARDED_STEPS) {
+            return finish("failed", { error: "step " + step + ": " + reason + " (" + discardedSteps + " steps discarded this run)" });
+          }
+          discarded = true;
+          emit({ type: "discarded_step", step, retries, hardRejections, errors: errors ?? [], usage });
         }
       }
+    }
+
+    if (!accepted) {
+      // Spend the step, keep Σt, and make the next prompt say what happened.
+      state.step = step;
+      steps = step;
+      totals.input += usage.input;
+      totals.output += usage.output;
+      totals.cacheRead += usage.cacheRead;
+      reasoningTotal += usage.reasoning;
+      promptTokenSum += usage.input;
+      maxPromptTokens = Math.max(maxPromptTokens, usage.input);
+      observation =
+        "Step " + step + " was discarded: your reply was rejected " + retries + " times and the state is unchanged. " +
+        "Each attempt fixed one thing and broke another; send a minimal reply that satisfies all of these at once:\n" +
+        rejections.map((r) => "- " + r).join("\n") +
+        "\n\nPrevious observation:\n" + observation;
+      continue;
     }
 
     // Commit Σt+1 (statusSince / readsSinceWrite were set by merge), then execute at.

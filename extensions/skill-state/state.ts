@@ -1,10 +1,11 @@
 import type { SkillExecutionState, StatePatch } from "./schemas";
 
-// Bounds enforced after merge (plan §5.2). Exceeding a count or the byte cap
-// fails the patch and leaves Σt untouched (paper §7 rollback-retry). Over-long
-// values are cut instead and reported in the next observation: models cannot
-// count characters, and "value longer than 300 chars" was 14 of 25 rejections
-// in one run, killing it once on three consecutive 301-430 char values.
+// Bounds enforced after merge (plan §5.2). Exceeding a count (other than facts)
+// or the byte cap fails the patch and leaves Σt untouched (paper §7
+// rollback-retry). Over-long values are cut and over-count facts are evicted
+// instead, reported in the next observation: models cannot count characters,
+// and "value longer than 300 chars" was 14 of 25 rejections in one run,
+// killing it once on three consecutive 301-430 char values.
 // The cut is marked in the value itself: at 300 chars a run split one 99-char
 // source line across six keys and then patched from a fact that had been cut
 // mid-token, which a trailing "…" did not warn it about (improvements_3 §7).
@@ -50,11 +51,15 @@ function clip(value: string, max: number): string {
   return value.length > max ? value.slice(0, max) + CUT_MARKER : value;
 }
 
-/** Merge one string map with null-delete, cutting over-long values and noting each cut. */
+/**
+ * Merge one string map with null-delete, cutting over-long values and noting
+ * each cut. A written key is deleted first so it moves to the end: key order is
+ * recency, which is what `evictOldest` relies on.
+ */
 function mergeMap(target: Record<string, string>, patch: Record<string, string | null>, field: string, max: number, notices: string[]): void {
   for (const [key, value] of Object.entries(patch)) {
-    if (value === null) delete target[key];
-    else {
+    delete target[key];
+    if (value !== null) {
       if (value.length > max) {
         notices.push(
           field + "." + key + " was " + value.length + " chars; kept the first " + max + " and marked the value \"" + CUT_MARKER.trim() +
@@ -66,22 +71,45 @@ function mergeMap(target: Record<string, string>, patch: Record<string, string |
   }
 }
 
+/**
+ * Over the key cap, drop the oldest keys not written by this patch (then the
+ * oldest written ones, if the patch alone is over). Like over-long values this
+ * is a notice, not a rejection: at the cap every new fact needed a deletion in
+ * the same patch, and one run spent 8 of its last 10 attempts failing that
+ * ("41 keys, limit 40" alternating with mis-nested deletes) before it died.
+ */
+function evictOldest(target: Record<string, string>, written: Set<string>, field: string, max: number, notices: string[]): void {
+  const keys = Object.keys(target);
+  if (keys.length <= max) return;
+  const dropped: string[] = [];
+  for (const key of [...keys.filter((k) => !written.has(k)), ...keys.filter((k) => written.has(k))]) {
+    if (Object.keys(target).length <= max) break;
+    delete target[key];
+    dropped.push(key);
+  }
+  notices.push(
+    field + " went over the limit of " + max + " keys; dropped the oldest: " + dropped.join(", ") +
+      ". Delete stale keys yourself (\"key\": null) to choose what goes.",
+  );
+}
+
 /** Σ ⊕ ΔΣ: objects merge shallowly with null-delete, lists are replaced whole. */
 function applyPatch(state: SkillExecutionState, patch: StatePatch, notices: string[]): SkillExecutionState {
   const next: SkillExecutionState = structuredClone(state);
   if (patch.status !== undefined) next.status = patch.status;
   if (patch.plan !== undefined) next.plan = [...patch.plan];
   if (patch.blockers !== undefined) next.blockers = [...patch.blockers];
-  if (patch.facts) mergeMap(next.facts, patch.facts, "facts", MAX_FACT_VALUE_CHARS, notices);
+  if (patch.facts) {
+    mergeMap(next.facts, patch.facts, "facts", MAX_FACT_VALUE_CHARS, notices);
+    evictOldest(next.facts, new Set(Object.keys(patch.facts)), "facts", MAX_FACTS, notices);
+  }
   if (patch.hypotheses) mergeMap(next.hypotheses, patch.hypotheses, "hypotheses", MAX_HYPOTHESIS_CHARS, notices);
   return next;
 }
 
 function boundErrors(state: SkillExecutionState): string[] {
   const errors: string[] = [];
-  const factKeys = Object.keys(state.facts);
-  if (factKeys.length > MAX_FACTS) errors.push("/facts: " + factKeys.length + " keys, limit " + MAX_FACTS + "; delete stale keys with null");
-  for (const key of factKeys) {
+  for (const key of Object.keys(state.facts)) {
     if (key.length > MAX_FACT_KEY_CHARS) errors.push("/facts/" + key + ": key is " + key.length + " chars, limit " + MAX_FACT_KEY_CHARS);
   }
   const hypothesisKeys = Object.keys(state.hypotheses);
@@ -175,7 +203,11 @@ export function isConcretePlanItem(item: string): boolean {
   return PATH_LIKE.test(t) || LEADING_VERB.test(t) || COMMAND_TOKEN.test(t) || t.includes("`");
 }
 
-const READ_ONLY_ACTIONS = new Set(["read_file", "search_files", "exec_shell", "git_diff", "tool"]);
+// Actions that advance the read streak in `editing`. `exec_shell` is not one:
+// running the checks after an edit is what the phase is for, and counting it
+// made read → read → rspec trip the gate on a run that then wanted to re-read
+// the one file its next edit needed.
+const STREAK_ACTIONS = new Set(["read_file", "search_files", "git_diff", "tool"]);
 const WRITE_ACTIONS = new Set(["write_file", "patch_file"]);
 
 /**
@@ -183,9 +215,13 @@ const WRITE_ACTIONS = new Set(["write_file", "patch_file"]);
  * READS_BEFORE_EDIT actions that changed nothing the next action must be an
  * edit or finish, and after EDIT_STALL_STEPS steps with no file changed the
  * phase itself has to end. Facts hold what was learned; re-reading is not
- * progress, and neither is a patch that keeps being rejected.
+ * progress, and neither is a patch that keeps being rejected. One exception:
+ * at the gate, a single read_file of the file the first plan item names is
+ * allowed, because the model cannot see the observation it read it in and
+ * "use the text you already read" asks for something it no longer has.
  */
-export function actionErrors(next: SkillExecutionState, actionType: string): string[] {
+export function actionErrors(next: SkillExecutionState, action: { type: string; path?: string }): string[] {
+  const actionType = action.type;
   if (actionType === "finish") return [];
   // `testing` is the one phase whose steps are meant to change nothing.
   const stalled = next.step + 1 - Math.max(next.statusSince, next.lastWriteStep) - 1;
@@ -199,9 +235,12 @@ export function actionErrors(next: SkillExecutionState, actionType: string): str
   }
   if (next.status !== "editing") return [];
   if (next.readsSinceWrite < READS_BEFORE_EDIT || WRITE_ACTIONS.has(actionType)) return [];
+  if (actionType === "read_file" && next.readsSinceWrite === READS_BEFORE_EDIT && action.path && next.plan[0]?.includes(action.path)) return [];
   return [
-    "/action: " + next.readsSinceWrite + " actions since the last file change while in \"editing\" (failed edits count). " +
-      "The next action must be write_file or patch_file applying the first plan item (use the exact text you already read), or finish.",
+    "/action: " + next.readsSinceWrite + " actions since the last file change while in \"editing\" " +
+      "(reads, searches, git_diff and rejected writes count; exec_shell does not). " +
+      "The next action must be write_file or patch_file applying the first plan item, or finish. " +
+      "If you no longer have the exact text, patch_file on a short fragment you are certain of (a class or def line) is enough.",
   ];
 }
 
@@ -215,7 +254,7 @@ export function recordAction(state: SkillExecutionState, actionType: string, cha
   if (changed) {
     state.readsSinceWrite = 0;
     state.lastWriteStep = state.step;
-  } else if (READ_ONLY_ACTIONS.has(actionType) || WRITE_ACTIONS.has(actionType)) {
+  } else if (STREAK_ACTIONS.has(actionType) || WRITE_ACTIONS.has(actionType)) {
     state.readsSinceWrite++;
   }
 }
