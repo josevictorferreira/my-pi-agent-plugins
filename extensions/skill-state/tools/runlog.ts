@@ -162,7 +162,13 @@ for (const e of events) {
 const end = ends[ends.length - 1];
 if (end) {
   const s = end.summary;
-  console.log("\n" + s.status + (s.outcome ? " (" + s.outcome + ")" : "") + " after " + s.steps + " steps; tokens in/out " + s.totals.input + "/" + s.totals.output + "; re-reads " + s.reReadCount);
+  console.log(
+    "\n" + s.status + (s.outcome ? " (" + s.outcome + ")" : "") + " after " + s.steps + " steps" +
+      (s.elapsedMs !== undefined ? " in " + Math.round(s.elapsedMs / 1000) + "s" : "") +
+      "; tokens in/out " + s.totals.input + "/" + s.totals.output + " (" + (s.totals.input + s.totals.output) + " total)" +
+      (s.actions !== undefined ? "; tool calls " + s.actions + " (" + s.failedActions + " failed)" : "") +
+      "; re-reads " + s.reReadCount,
+  );
   if (s.error) console.log("error: " + s.error);
   if (s.summary) console.log("summary: " + s.summary);
   if (s.blockers.length) console.log("blockers:\n  - " + s.blockers.join("\n  - "));

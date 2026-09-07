@@ -146,7 +146,7 @@ An objective typed in quotes (`/state-run "fix the …"`) has the quotes strippe
   Expanded (the tool-output expansion key, `/help` shows the binding) adds the model's reasoning for that step (the runtime discards it after parsing; this is the only place it is visible), each rejection, up to 12 lines of the observation, and the byte/token detail. The full prompt, reply, state and observation stay in the run log, which is what `tools/runlog.ts` reads.
 - `skill-state-run` custom entry at the end with the run summary table, including a row per recorded check.
 - Both are custom entries and are **never sent to the LLM**.
-- One `skill-state-result` custom message (≤ 1 KB: outcome, summary, changed files, last checks, token totals) is queued for the outer conversation with `deliverAs: "nextTurn"`. It enters context only when you next speak; no turn is triggered. This is the only way the run affects the outer agent's context, whatever the step count.
+- One `skill-state-result` custom message (≤ 1 KB: outcome, summary, changed files, last checks, token totals, elapsed time, tool call and failed call counts) is queued for the outer conversation with `deliverAs: "nextTurn"`. It enters context only when you next speak; no turn is triggered. This is the only way the run affects the outer agent's context, whatever the step count.
 
 ## What this reproduces from the paper, and what it does not
 

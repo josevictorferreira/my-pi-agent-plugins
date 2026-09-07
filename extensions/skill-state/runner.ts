@@ -121,6 +121,10 @@ export interface Checkpoint {
   totals: { input: number; output: number; cacheRead: number };
   reasoningTokens?: number;
   reReadCount: number;
+  /** Wall time and action counts so far, so a resumed run keeps accumulating. */
+  elapsedMs?: number;
+  actions?: number;
+  failedActions?: number;
   /** Set when the model itself ended the run with cannot_complete. */
   outcome?: "cannot_complete";
 }
@@ -144,6 +148,11 @@ export interface RunSummary {
   minPromptBytes: number;
   maxPromptBytes: number;
   reReadCount: number;
+  /** Wall time of the run, including earlier segments when resumed. */
+  elapsedMs: number;
+  /** Actions executed (every step except `finish`) and how many of them failed. */
+  actions: number;
+  failedActions: number;
   changedFiles: string[];
   checks: SkillExecutionState["checks"];
   blockers: string[];
@@ -337,6 +346,10 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   let minPromptBytes = Infinity;
   let maxPromptBytes = 0;
   let reReadCount = resume?.reReadCount ?? 0;
+  const runStarted = Date.now();
+  const elapsedBefore = resume?.elapsedMs ?? 0;
+  let actions = resume?.actions ?? 0;
+  let failedActions = resume?.failedActions ?? 0;
   let reasoningTotal = resume?.reasoningTokens ?? 0;
   let reasoningReported = resume?.reasoningTokens !== undefined;
   let steps = state.step;
@@ -356,6 +369,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
 
   const finish = (status: RunStatus, extra: Partial<RunSummary> = {}): RunSummary => {
     const own = steps - firstStep;
+    const elapsedMs = elapsedBefore + (Date.now() - runStarted);
     const summary: RunSummary = {
       runId,
       objective,
@@ -369,6 +383,9 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       minPromptBytes: own ? minPromptBytes : 0,
       maxPromptBytes,
       reReadCount,
+      elapsedMs,
+      actions,
+      failedActions,
       changedFiles: [...state.changedFiles],
       checks: [...state.checks],
       blockers: [...state.blockers],
@@ -377,6 +394,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
           ? undefined
           : {
               runId, objective, spec, maxSteps: options.maxSteps, state, observation, totals, reReadCount,
+              elapsedMs, actions, failedActions,
               reasoningTokens: reasoningReported ? reasoningTotal : undefined,
               outcome: extra.outcome === "cannot_complete" ? "cannot_complete" : undefined,
             },
@@ -529,6 +547,11 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     const result = await execute(action, cwd, signal, options.tools);
     const body = observationBody(result.observation);
     const resultLine = resultLineOf(action, body);
+    const resultOk = result.kind !== "error" && !FAILED_RESULT.test(resultLine);
+    if (action.type !== "finish") {
+      actions++;
+      if (!resultOk) failedActions++;
+    }
     recordAction(state, action.type, result.changed !== undefined);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
     if (action.type === "read_file" || action.type === "search_files") {
@@ -595,7 +618,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       reasoningTokens: reasoningReported ? usage.reasoning : undefined,
       actionSummary,
       resultLine: resultLine.replace(/^Error: /, ""),
-      resultOk: result.kind !== "error" && !FAILED_RESULT.test(resultLine),
+      resultOk,
       observationPreview: previewOf(body),
       reasoningHead: accepted.reasoning.slice(0, MAX_REASONING_HEAD),
       statusChange: state.status === statusBefore ? undefined : statusBefore + " → " + state.status,

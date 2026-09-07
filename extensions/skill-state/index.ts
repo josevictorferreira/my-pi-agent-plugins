@@ -196,6 +196,8 @@ function resultMessage(summary: RunSummary): string {
     );
   }
   lines.push("Steps: " + summary.steps + " of " + summary.maxSteps);
+  lines.push("Elapsed: " + duration(summary.elapsedMs));
+  lines.push("Tool calls: " + summary.actions + " (" + summary.failedActions + " failed)");
   lines.push(
     "Tokens: " +
       (summary.totals.input + summary.totals.output) +
@@ -254,8 +256,10 @@ export default function (pi: ExtensionAPI) {
     if (!s) return undefined;
     const rows: Array<[string, string]> = [
       ["status", s.status + (s.outcome ? " (" + s.outcome + ")" : "")],
+      ["elapsed", duration(s.elapsedMs ?? 0)],
       ["steps", String(s.steps)],
-      ["tokens in/out", s.totals.input + " / " + s.totals.output + (s.reasoningTokens ? " (hidden reasoning " + s.reasoningTokens + ")" : "")],
+      ["tool calls", (s.actions ?? 0) + " (" + (s.failedActions ?? 0) + " failed)"],
+      ["tokens", (s.totals.input + s.totals.output) + " total (in " + s.totals.input + " / out " + s.totals.output + (s.reasoningTokens ? ", hidden reasoning " + s.reasoningTokens : "") + ")"],
       ["prompt tokens avg/max", s.avgPromptTokens + " / " + s.maxPromptTokens],
       ["prompt bytes min/max", s.minPromptBytes + " / " + s.maxPromptBytes],
       ["re-reads", String(s.reReadCount)],
@@ -364,11 +368,12 @@ export default function (pi: ExtensionAPI) {
       { triggerTurn: false, deliverAs: "nextTurn" },
     );
     const tokens = summary.totals.input + summary.totals.output;
+    const cost = duration(summary.elapsedMs) + ", " + tokens + " tokens, " + summary.actions + " tool calls (" + summary.failedActions + " failed)";
     if (summary.status === "completed") {
-      ctx.ui.notify("state-run completed: " + summary.steps + " steps, " + tokens + " tokens", "info");
+      ctx.ui.notify("state-run completed: " + summary.steps + " steps, " + cost, "info");
     } else {
       ctx.ui.notify(
-        "state-run " + summary.status + " at step " + summary.steps + " (" + tokens + " tokens). " +
+        "state-run " + summary.status + " at step " + summary.steps + " (" + cost + "). " +
           "Checkpoint " + summary.runId + " saved: switch model if needed, then /state-resume [--max-steps N] [note]",
         "warning",
       );
