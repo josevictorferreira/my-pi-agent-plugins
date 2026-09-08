@@ -19,7 +19,7 @@ press Enter yourself.
 | --- | --- | --- |
 | `VELOX_API_URL` | `https://velox.josevictor.me` | shared with tts/web-tools |
 | `VELOX_API_KEY` | — | required; checked before recording starts |
-| `STT_MODEL` | `stt-1` | transcription alias |
+| `STT_MODEL` | `scribe` | transcription combo/model alias (velox `[combos.scribe]`: elevenlabs-stt) |
 | `STT_LANGUAGE` | unset (auto-detect) | ISO-639-1 code sent as `language` |
 | `STT_RECORDER` | auto-detect | recorder command; output path appended as last arg |
 | `STT_MAX_SECONDS` | `120` | auto-stop cap |

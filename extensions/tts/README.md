@@ -33,7 +33,7 @@ convenience: no tools, nothing enters the LLM conversation.
 | --- | --- | --- |
 | `VELOX_API_URL` | `https://velox.josevictor.me` | Velox base URL (shared with web-tools) |
 | `VELOX_API_KEY` | — | required bearer token |
-| `TTS_MODEL` | `tts-1` | speech model alias |
+| `TTS_MODEL` | `voice` | speech combo/model alias (velox `[combos.voice]`: speechify-tts, then elevenlabs-tts) |
 | `TTS_VOICE` | `geffen_32` | voice |
 | `TTS_SUMMARY_MODEL` | `deepseek-v4-flash` | chat model alias for the summary |
 | `TTS_AUTO_SPEAK` | off | `1`/`true` speaks every reply automatically when the agent stops |

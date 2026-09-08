@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 const DEFAULT_API_URL = "https://velox.josevictor.me";
 
-const STT_MODEL = () => process.env.STT_MODEL || "stt-1";
+const STT_MODEL = () => process.env.STT_MODEL || "scribe";
 const STT_LANGUAGE = () => process.env.STT_LANGUAGE || "";
 const STT_MAX_SECONDS = () => Number(process.env.STT_MAX_SECONDS) || 120;
 
