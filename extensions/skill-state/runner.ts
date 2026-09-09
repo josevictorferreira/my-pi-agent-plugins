@@ -1,9 +1,9 @@
 import { stat } from "node:fs/promises";
 import { relative, resolve } from "node:path";
-import { execute, type ObservationKind, type ToolRunner } from "./executor";
+import { checkCommandKey, execute, isCheckCommand, type ObservationKind, type ToolRunner } from "./executor";
 import { covers, noteOpen, renderOpenFiles, type OpenWindow } from "./openfiles";
 import { lastFencedJson, reasoningText, render, type RenderedPrompt } from "./prompt";
-import { relocateStrayFacts, validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
+import { repairPatchShape, validateStepResponse, type RepoAction, type SkillExecutionState, type StatePatch, type StepResponse } from "./schemas";
 import { actionErrors, createInitialState, merge, recordAction, recordChanged, recordCheck, recordInspected, serializeState } from "./state";
 
 // Algorithm 1 of the paper: A_t = (P, Σt, Ot) → (Rt, ΔΣt, at); Σt+1 = Σt ⊕ ΔΣt;
@@ -338,6 +338,9 @@ export async function run(options: RunOptions): Promise<RunSummary> {
   let state = resume ? structuredClone(resume.state) : createInitialState(objective);
   // Checkpoints written before lastWriteStep existed resume as if nothing was written.
   state.lastWriteStep = state.lastWriteStep ?? 0;
+  // Same for workSince: undefined would make the stall term NaN, which is
+  // never >= EDIT_STALL_STEPS, i.e. the guard silently off for the whole run.
+  state.workSince = state.workSince ?? (state.status === "inspecting" ? 0 : state.step);
   let observation = resume ? resume.observation : await initialObservation(cwd, signal);
   if (resume) {
     observation =
@@ -483,7 +486,7 @@ export async function run(options: RunOptions): Promise<RunSummary> {
       }
 
       const parsed = lastFencedJson(reply.text);
-      const relocated = parsed.ok ? relocateStrayFacts(parsed.value) : [];
+      const relocated = parsed.ok ? repairPatchShape(parsed.value) : [];
       errors = parsed.ok ? validateStepResponse(parsed.value) : [parsed.error];
       let hard = errors.length > 0;
       const reasoning = parsed.ok ? reasoningText(reply.text, parsed.start) : "";
@@ -614,7 +617,12 @@ export async function run(options: RunOptions): Promise<RunSummary> {
     recordAction(state, action.type, result.changed !== undefined);
     if (action.type === "read_file" && result.inspected?.some((p) => state.inspectedFiles.includes(p))) reReadCount++;
     if (action.type === "read_file" || action.type === "search_files" || action.type === "exec_shell") {
-      const key = JSON.stringify(action);
+      // A check keyed without its output-format flags: `rspec --format progress`
+      // is the same check as `rspec` and returns the same verdict.
+      const key =
+        action.type === "exec_shell" && isCheckCommand(action.command)
+          ? JSON.stringify({ ...action, command: checkCommandKey(action.command) })
+          : JSON.stringify(action);
       const earlier = seenReads.get(key);
       if (earlier !== undefined) {
         // "Use facts instead" is right for structural knowledge and wrong right
@@ -627,8 +635,8 @@ export async function run(options: RunOptions): Promise<RunSummary> {
             : action.type === "exec_shell"
               // One run ran the same mistyped rspec path three times and read the
               // repeated error as "the spec file does not exist".
-              ? "Note: this exact command already ran at step " + earlier + " and no file changed since, so its result is the same. " +
-                "If it is not what you expected, the command itself is what to change.\n"
+              ? "Note: this command already ran at step " + earlier + " and no file changed since, so its result is the same " +
+                "(a different --format prints the same verdict). If it is not what you expected, the command itself is what to change.\n"
               : "Note: this exact action already ran at step " + earlier + " and nothing changed since. " +
                 "Record what you need in facts instead of repeating it.\n") + result.observation;
       }

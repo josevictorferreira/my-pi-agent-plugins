@@ -27,6 +27,7 @@ export function createInitialState(objective: string): SkillExecutionState {
     version: 1,
     step: 0,
     statusSince: 0,
+    workSince: 0,
     readsSinceWrite: 0,
     lastWriteStep: 0,
     objective,
@@ -151,9 +152,10 @@ export const PLANNING_STEPS = 2;
 /** In `editing`, actions that changed nothing allowed between two writes. */
 export const READS_BEFORE_EDIT = 3;
 /**
- * Steps `editing` may run without a file actually changing. `inspecting` and
- * `planning` are budgeted; `editing` was not, and one run spent 138 consecutive
- * steps there re-sending a patch that could not apply (improvements_3 §4).
+ * Steps `editing`, `repairing` or `testing` may run without a file actually
+ * changing. `inspecting` and `planning` have budgets of their own; these three
+ * had none, and one run spent 138 consecutive steps in `editing` re-sending a
+ * patch that could not apply (improvements_3 §4).
  */
 export const EDIT_STALL_STEPS = 12;
 
@@ -219,18 +221,36 @@ const WRITE_ACTIONS = new Set(["write_file", "patch_file"]);
  * at the gate, a single read_file of the file the first plan item names is
  * allowed, because the model cannot see the observation it read it in and
  * "use the text you already read" asks for something it no longer has.
+ *
+ * `testing` is bound too. It used to be exempt — its steps are meant to change
+ * nothing — which made it the one phase with no budget of any kind: a run held
+ * 13 of 54 steps there and spent them on three reads and a patch_file, and a
+ * model that simply leaves `status` at `testing` gets unlimited reads and
+ * writes (improvements_4 §2). Writes belong to `editing`/`repairing`, which the
+ * spec already says; a phase that runs checks for EDIT_STALL_STEPS without one
+ * edit is not testing anything either.
  */
 export function actionErrors(next: SkillExecutionState, action: { type: string; path?: string }): string[] {
   const actionType = action.type;
   if (actionType === "finish") return [];
-  // `testing` is the one phase whose steps are meant to change nothing.
-  const stalled = next.step + 1 - Math.max(next.statusSince, next.lastWriteStep) - 1;
-  if ((next.status === "editing" || next.status === "repairing") && stalled >= EDIT_STALL_STEPS) {
+  if (next.status === "testing" && WRITE_ACTIONS.has(actionType)) {
+    return [
+      '/status: "testing" runs the checks, it does not edit. Set status to "repairing", record in facts which check failed and why, ' +
+        "and send the same edit again: one reply can do both.",
+    ];
+  }
+  // Since the last file changed, not since the phase began: `statusSince` in
+  // this term let an `editing` ⇄ `repairing` alternation zero the count every
+  // flip, and flipping on rejection is what a model under a failing patch does.
+  // One run changed status 12 times in 54 steps and never got past a stall of 3
+  // (improvements_4 §3). `workSince` anchors it before the first write lands.
+  const stalled = next.step + 1 - Math.max(next.lastWriteStep, next.workSince) - 1;
+  if (next.status !== "inspecting" && next.status !== "planning" && stalled >= EDIT_STALL_STEPS) {
     return [
       "/status: " + stalled + " steps in \"" + next.status + "\" and no file has changed" +
         (next.lastWriteStep ? " since step " + next.lastWriteStep : " at all") +
-        ". Repeating the same edit will not start working. Record in facts what the failed attempts have in common, then change status to a " +
-        "different phase (\"repairing\" to diagnose the failure, \"testing\" if the change is already in place) or send finish with what remains.",
+        ". Repeating the same edit will not start working. Record in facts what the failed attempts have in common, then either make a " +
+        "different edit, or send finish with what changed and what remains.",
     ];
   }
   if (next.status !== "editing") return [];
@@ -270,6 +290,7 @@ export function merge(state: SkillExecutionState, patch: StatePatch, policy?: Ph
     // reads do not count.
     next.statusSince = state.step + 1;
     if (next.status === "editing") next.readsSinceWrite = 0;
+    if (next.workSince === 0 && next.status !== "inspecting") next.workSince = state.step + 1;
   }
   const errors = boundErrors(next);
   if (policy) errors.push(...phaseErrors(state, next, patch, policy));

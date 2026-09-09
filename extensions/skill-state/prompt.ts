@@ -19,12 +19,12 @@ const ACTION_VOCABULARY =
 
 const STATE_RULES =
   "State update rules:\n" +
-  '- "state_patch" is merged: send only keys you change. facts/hypotheses merge by key, null deletes; plan/blockers are replaced whole.\n' +
-  "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, readsSinceWrite, lastWriteStep, objective, inspectedFiles, changedFiles, checks.\n" +
+  '- "state_patch" is merged: send only keys you change. facts/hypotheses merge by key, null deletes; plan/blockers are replaced whole (arrays of strings, one "path: change" per item).\n' +
+  "- status is one of: inspecting, planning, editing, testing, repairing. Runtime-owned, never send: version, step, statusSince, workSince, readsSinceWrite, lastWriteStep, objective, inspectedFiles, changedFiles, checks.\n" +
   "- Before leaving a file, write what you learned into facts; you will not see this observation again.\n" +
   "- The files you read or wrote most recently stay open (up to 4, within 8 KB): their current text is shown under \"Open files\" (or is the latest observation) and is refreshed after every edit. Reading lines that are already shown is rejected; copy oldText from the text shown.\n" +
   "- Limits: facts ≤ 40 (over that the oldest are dropped; values ≤ 600 chars; a longer value is cut, marked \" [CUT]\" and is no longer exact text), hypotheses ≤ 12 (≤ 200 chars, same), plan/blockers ≤ 15 items, state ≤ 12 KB. One idea per key; split long notes across keys.\n" +
-  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 actions that change nothing between writes (a rejected patch is one of them; exec_shell is not); editing and repairing end after 12 steps without a file change; testing needs a changed file. Violations are rejected and you are asked again.";
+  "- Enforced phases: leave inspecting within a third of the budget (max 30 steps); planning ≤ 2 steps and needs a plan whose items each name a file or a command; editing allows 3 actions that change nothing between writes (a rejected patch is one of them; exec_shell is not); testing needs a changed file and runs checks only — to edit, set status to editing or repairing first; editing, repairing and testing end after 12 steps without a file change, counted from the last change and not reset by a status change. Violations are rejected and you are asked again.";
 
 const RESPONSE_FORMAT =
   "Provide your response with:\n" +

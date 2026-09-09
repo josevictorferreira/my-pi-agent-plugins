@@ -281,8 +281,15 @@ would have fit. Scan the tail for a failure-count line (`N failures`, `N failed`
     after a resume: *"resumed at step N; the previous segment ended in `editing` after K steps
     with no file change"*. The model currently cannot tell it is repeating a dead segment.
     (Finding 11)
-12. **Enable prompt caching on the stable prefix** (medium, depends on what Pi exposes). Over
+12. ~~**Enable prompt caching on the stable prefix**~~ (medium, depends on what Pi exposes). Over
     4 KB of every prompt is byte-identical; `cacheRead` was 0 for the entire run. (Finding 11)
+    **Closed as not achievable for these providers** (2026-09-08). The stable prefix was moved
+    into the system prompt, where pi-ai puts the provider's cache marker, and `cacheRead` was
+    still 0 on all 56 attempts of `sr-mtrd4n6r`. Measured cause: OpenRouter returns no cache
+    hits below roughly 9k tokens of prefix, and the prefix here is about 4 KB — roughly 1k
+    tokens. Open files enlarge the user half of the prompt, not the cacheable prefix, so this
+    does not improve with more context either. Re-open only for a provider that caches short
+    prefixes. (improvements_4 §5)
 
 ## What this data cannot tell you
 

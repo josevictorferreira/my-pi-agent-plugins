@@ -579,6 +579,23 @@ export function isCheckCommand(command: string): boolean {
   return CHECK_COMMAND.test(command);
 }
 
+// Flags that change how a runner prints, not what it runs. Long forms only:
+// `-f` is a formatter to rspec and a makefile to make, and this only has to
+// cover what a model reaches for when it distrusts an answer.
+const FORMAT_FLAGS = /\s+--(?:format|formatter|reporter)(?:[= ]\S+)?|\s+--(?:no-)?colou?r\b|\s+--(?:verbose|quiet)\b/g;
+
+/**
+ * A check command with its output-format flags removed, for deciding whether
+ * two commands are the same check. One run ran `rspec`, `rspec`,
+ * `rspec --format documentation` and `rspec --format progress` over a
+ * byte-identical tree; keyed on the raw string, only the second of those was
+ * recognised as a repeat (improvements_4 §4). Changing the formatter is exactly
+ * what a model does when it does not believe the answer it already has.
+ */
+export function checkCommandKey(command: string): string {
+  return command.replace(FORMAT_FLAGS, "").trim().replace(/\s+/g, " ");
+}
+
 // Test runners that exit 0 through a `| tail` still say so in their output.
 const FAILURE_SIGNS = [
   /\b[1-9]\d* (failures?|failed|errors?|offenses?)\b/i,

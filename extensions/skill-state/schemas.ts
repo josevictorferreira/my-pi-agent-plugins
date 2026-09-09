@@ -14,6 +14,12 @@ export interface SkillExecutionState {
   step: number;
   /** Step at which `status` last changed (phase budgets are measured from here). */
   statusSince: number;
+  /**
+   * Step at which the run first left `inspecting`; 0 while it never has. The
+   * stall guard measures from here until the first write lands, so that a
+   * phase change cannot reset it.
+   */
+  workSince: number;
   /** Reads, searches and failed writes since the last write that changed a file (exec_shell does not count). */
   readsSinceWrite: number;
   /** Step at which a file last actually changed; 0 when nothing has changed yet. */
@@ -44,10 +50,29 @@ export const StatePatchSchema = Type.Object(
 export type StatePatch = Static<typeof StatePatchSchema>;
 
 const PATCH_KEYS = new Set(Object.keys(StatePatchSchema.properties));
-const RUNTIME_OWNED = new Set(["version", "step", "statusSince", "readsSinceWrite", "lastWriteStep", "objective", "inspectedFiles", "changedFiles", "checks"]);
+const RUNTIME_OWNED = new Set(["version", "step", "statusSince", "workSince", "readsSinceWrite", "lastWriteStep", "objective", "inspectedFiles", "changedFiles", "checks"]);
+
+// Keys that name the file in an object plan item; anything else string-valued
+// on it is the description. `{"path": …, "change": …}` is what runs actually
+// send, but the pair is spelled a dozen ways and only the order matters.
+const ITEM_PATH_KEYS = new Set(["path", "file", "filename", "filepath", "target"]);
 
 /**
- * Repair two patch shapes in place instead of rejecting them, and return one
+ * One plan or blocker item as the "path: change" string the schema wants, or
+ * undefined when the object carries no string to build it from (that still
+ * fails validation, on its merits).
+ */
+function flattenItem(item: unknown): string | undefined {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+  const strings = Object.entries(item as Record<string, unknown>).filter(([, v]) => typeof v === "string" && v.trim() !== "") as [string, string][];
+  if (!strings.length) return undefined;
+  const path = strings.find(([key]) => ITEM_PATH_KEYS.has(key));
+  const rest = strings.filter((entry) => entry !== path).map(([, v]) => v);
+  return (path ? [path[1], ...rest] : rest).join(": ");
+}
+
+/**
+ * Repair three patch shapes in place instead of rejecting them, and return one
  * notice per repair. Facts the model put directly under `state_patch` are moved
  * into `state_patch.facts`: `{"state_patch": {"foo": null}}` for "delete fact
  * foo" was 14 of 24 rejections in one run, each a hard one, and the schema error
@@ -56,8 +81,17 @@ const RUNTIME_OWNED = new Set(["version", "step", "statusSince", "readsSinceWrit
  * validation. Runtime-owned keys (`changedFiles`, `inspectedFiles`, `checks`…)
  * are dropped: the runtime already tracks them, the model was only narrating
  * what it did, and one run paid 7 full retries for it.
+ *
+ * Plan and blocker items sent as objects are flattened to "path: change". The
+ * cost of rejecting them is not the retry: one run sent
+ * `plan: [{"path": …, "change": …}]`, got `/state_patch/plan/0: must be string`,
+ * and on the retry did not just fix the plan — it withdrew a correct
+ * `patch_file` in favour of re-reading the file it had just read, then of a
+ * no-op `git_diff` (improvements_4 §1). A schema error makes the model rewrite
+ * the whole reply, and it rewrites the action more timidly than it needs to.
+ * `isConcretePlanItem` still judges whatever comes out of the flattening.
  */
-export function relocateStrayFacts(value: unknown): string[] {
+export function repairPatchShape(value: unknown): string[] {
   if (!value || typeof value !== "object") return [];
   const patch = (value as Record<string, unknown>).state_patch;
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) return [];
@@ -66,6 +100,25 @@ export function relocateStrayFacts(value: unknown): string[] {
   const dropped = Object.keys(p).filter((key) => RUNTIME_OWNED.has(key));
   for (const key of dropped) delete p[key];
   if (dropped.length) notices.push("state_patch." + dropped.join(", state_patch.") + " ignored: runtime-owned, the runtime tracks it.");
+  for (const field of ["plan", "blockers"] as const) {
+    const list = p[field];
+    if (!Array.isArray(list)) continue;
+    const flattened: string[] = [];
+    let first: string | undefined;
+    list.forEach((item, i) => {
+      const flat = flattenItem(item);
+      if (flat === undefined) return;
+      list[i] = flat;
+      flattened.push(field + "[" + i + "]");
+      first ??= flat;
+    });
+    if (first !== undefined) {
+      notices.push(
+        "state_patch." + flattened.join(", state_patch.") + " was an object; flattened to \"" + first.slice(0, 80) + "\". " +
+          field + " is an array of strings, one \"path: change\" per item.",
+      );
+    }
+  }
   if (p.facts !== undefined && (!p.facts || typeof p.facts !== "object" || Array.isArray(p.facts))) return notices;
   const moved: string[] = [];
   for (const [key, v] of Object.entries(p)) {
