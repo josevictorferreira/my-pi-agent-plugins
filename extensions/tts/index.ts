@@ -119,7 +119,7 @@ async function summarize(text: string, signal: AbortSignal): Promise<string> {
   return content.trim().slice(0, MAX_SPEECH_CHARS);
 }
 
-/** Convert text to mp3 audio bytes via Velox. */
+/** Convert text to wav audio bytes via Velox. */
 async function synthesize(input: string, signal: AbortSignal): Promise<Buffer> {
   const response = await veloxFetch(
     "/v1/audio/speech",
@@ -127,7 +127,7 @@ async function synthesize(input: string, signal: AbortSignal): Promise<Buffer> {
       model: TTS_MODEL(),
       input,
       voice: TTS_VOICE(),
-      response_format: "mp3",
+      response_format: "wav",
     },
     signal,
   );
@@ -354,7 +354,7 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
   }
 
   // Unique per run so a superseded run's cleanup can't delete the new file.
-  const file = join(tmpdir(), "pi-tts-" + process.pid + "-" + ++runSeq + ".mp3");
+  const file = join(tmpdir(), "pi-tts-" + process.pid + "-" + ++runSeq + ".wav");
   const run = { controller, file };
   current = run;
 

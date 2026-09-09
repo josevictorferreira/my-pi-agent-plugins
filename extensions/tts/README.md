@@ -19,7 +19,7 @@ convenience: no tools, nothing enters the LLM conversation.
 2. Short, code-free replies (≤300 chars) are spoken directly after stripping
    markdown; longer ones are summarized in 2–3 spoken sentences via Velox
    `POST /v1/chat/completions`.
-3. Speech is synthesized with Velox `POST /v1/audio/speech` (mp3), cached
+3. Speech is synthesized with Velox `POST /v1/audio/speech` (wav), cached
    in a temp file keyed by the message ID and configuration, and played
    locally. Re-running `/speak` on the same message reuses the cached audio
    without making summarization or TTS API calls. Cached files are cleaned up on
