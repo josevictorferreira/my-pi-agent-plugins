@@ -5,7 +5,7 @@
 **Branch:** main
 
 ## OVERVIEW
-Single Bun/TypeScript pi package containing eight independently loaded extensions. Pi loads `extensions/*/index.ts` through jiti; there is no build step and the repository has one root package boundary.
+Single Bun/TypeScript pi package containing nine independently loaded extensions. Pi loads `extensions/*/index.ts` through jiti; there is no build step and the repository has one root package boundary.
 
 ## STRUCTURE
 ```text
@@ -14,13 +14,14 @@ Single Bun/TypeScript pi package containing eight independently loaded extension
 │   ├── codegraph/            # CodeGraph CLI-backed semantic exploration
 │   ├── context7/             # Context7 documentation API client
 │   ├── hindsight/            # Hindsight memory API and automatic retention
-│   ├── lsp/                  # language-server client, configuration, and pi hooks
-│   ├── skill-state/          # SKILL.state runtime: /state-run bounded-state agent loop
-│   ├── stt/                  # microphone dictation into the prompt via Velox
-│   ├── tts/                  # spoken summary of the last reply via Velox
-│   └── web-tools/            # Velox web search and URL extraction
-├── .agents/plans/            # tracked design plans
-├── .agents/specs/            # reviewed implementation specs (skill-state)
+│ ├── lsp/ # language-server client, configuration, and pi hooks
+│ ├── notify/ # desktop notifications for agent outcomes via notify-send
+│ ├── skill-state/ # SKILL.state runtime: /state-run bounded-state agent loop
+│ ├── stt/ # microphone dictation into the prompt via Velox
+│ ├── tts/ # spoken summary of the last reply via Velox
+│ └── web-tools/ # Velox web search and URL extraction
+├──.agents/plans/ # tracked design plans
+├──.agents/specs/ # reviewed implementation specs (skill-state, notify)
 ├── package.json              # pi package metadata and check script
 ├── tsconfig.json             # strict no-emit TypeScript configuration
 └── README.md                 # package and plugin documentation
@@ -38,6 +39,7 @@ Single Bun/TypeScript pi package containing eight independently loaded extension
 | Understand installation/loading | `README.md`, `package.json` | `pi.extensions` points at `./extensions`; plugins ship without local dependencies. |
 | Understand or change the spoken-summary flow | `extensions/tts/index.ts` | `/speak` command and `ctrl+alt+s` shortcut; Velox chat summary + audio speech, local playback. |
 | Understand or change the dictation flow | `extensions/stt/index.ts` | `/dictate` command and `ctrl+alt+d` shortcut; local recording via `pw-record`/`ffmpeg`, Velox transcription, transcript appended to the prompt editor. |
+| Understand or change desktop notifications | `extensions/notify/index.ts`, `.agents/specs/0002-notify/plan.md` | Classifies `agent_settled` outcomes into success/question/error; sends a `notify-send`-style argv via `pi.exec` with a 5 s timeout; dedupes by assistant message id. |
 | Understand the SKILL.state design and its limits | `.agents/specs/0001-skill-state-plan.md`, `extensions/skill-state/README.md` | Paper claims vs. what is reproduced; verification gates; honesty notes. |
 | Change the state-run loop, retry, or telemetry | `extensions/skill-state/runner.ts` | Algorithm 1: render → complete → parse/validate → merge → execute; rollback-retry ≤ 2; per-step telemetry; `onEvent` trace. |
 | Debug a state-run | `/state-log` in Pi, then `bun extensions/skill-state/tools/runlog.ts <runId> [--rejections | --step N --prompt] --cwd <project>` | Reads `~/.pi/agent/skill-state/<cwd>/logs/<runId>.jsonl`; `listRunLogs` in `runlog.ts` is shared by the command and the tool. |
@@ -46,7 +48,7 @@ Single Bun/TypeScript pi package containing eight independently loaded extension
 | Change the built-in SE skill or `--skill` loading | `extensions/skill-state/workflow.ts` | Spec ≤ 4 KB, used verbatim as `{spec}`. |
 
 ## CODE MAP
-The package has 16 TypeScript source files and no tests. Reference counts below are structural indicators from the source layout rather than a generated call graph.
+The package has 17 TypeScript source files and no tests. Reference counts below are structural indicators from the source layout rather than a generated call graph.
 
 | Symbol | Type | Location | Role |
 | --- | --- | --- | --- |
@@ -94,6 +96,7 @@ The package has 16 TypeScript source files and no tests. Reference counts below 
 - LSP starts one stdio client per `(server, root)` lazily on first matching file touch; automatic edit/write feedback reports only severity-1 diagnostics, capped at 20 per file.
 - Web-tools and Context7 are thin HTTP adapters. Their README files are the source of truth for endpoint contracts and exposed parameters.
 - TTS and STT are user-invoked only (`/speak` + `ctrl+alt+s`, `/dictate` + `ctrl+alt+d`) and expose no model-facing tool.
+- notify is fully passive: no tool, command, or shortcut — it listens for `agent_settled`/`session_start`, classifies the last assistant reply from `stopReason` plus a trailing `?`, dedupes by message id, and downgrades a missing/failing `NOTIFY_COMMAND` binary to one `ctx.ui.notify` warning per session.
 - Skill-state runs its own model loop outside the Pi conversation: telemetry goes to `appendEntry` custom entries (`skill-state-step`, `skill-state-run`, never in LLM context) and one ≤ 1 KB `skill-state-result` message is queued with `deliverAs: "nextTurn"`. One run at a time; `/state-cancel` and `session_shutdown` abort it. Failed/cancelled runs persist a `skill-state-checkpoint` entry and a file under `~/.pi/agent/skill-state/<cwd>/<runId>.json` (`checkpoints.ts`); `/state-resume [--list] [--run id] [--max-steps N] [note]` continues from it with the current model (`launch()` in `index.ts` is shared by both commands). Pi only flushes a session file once it has an assistant message, which is why the file store exists. Model calls send no `reasoning` option on purpose, and no `temperature` unless `SKILL_STATE_TEMPERATURE` is set: some Velox upstreams (e.g. `gandalf`) reject the parameter with HTTP 400. `search_files` uses `git grep --untracked` so gitignored logs/build output never reach the model; `grep -r` only outside a git work tree.
 
 ## COMMANDS
