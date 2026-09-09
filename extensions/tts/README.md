@@ -16,9 +16,9 @@ convenience: no tools, nothing enters the LLM conversation.
 ## Behavior
 
 1. Reads the latest assistant text from the current session branch.
-2. Short, code-free replies (≤300 chars) are spoken directly after stripping
-   markdown; longer ones are summarized in 2–3 spoken sentences via Velox
-   `POST /v1/chat/completions`.
+2. The reply is summarized into 2–3 spoken sentences via Velox
+   `POST /v1/chat/completions`, written in `TTS_LANGUAGE`, so a reply in
+   another language is translated before it is spoken.
 3. Speech is synthesized with Velox `POST /v1/audio/speech` (wav), cached
    in a temp file keyed by the message ID and configuration, and played
    locally. Re-running `/speak` on the same message reuses the cached audio
@@ -36,6 +36,7 @@ convenience: no tools, nothing enters the LLM conversation.
 | `TTS_MODEL` | `voice` | speech combo/model alias (velox `[combos.voice]`: speechify-tts, then elevenlabs-tts) |
 | `TTS_VOICE` | `geffen_32` | voice |
 | `TTS_SUMMARY_MODEL` | `deepseek-v4-flash` | chat model alias for the summary |
+| `TTS_LANGUAGE` | `pt-BR` | spoken language — the summary is written in it and it is sent to the speech endpoint |
 | `TTS_AUTO_SPEAK` | off | `1`/`true` speaks every reply automatically when the agent stops |
 | `TTS_PLAYER` | auto-detect | explicit player command, e.g. `mpv --no-video --really-quiet` |
 

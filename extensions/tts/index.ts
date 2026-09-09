@@ -10,13 +10,11 @@ const DEFAULT_API_URL = "https://velox.josevictor.me";
 const TTS_MODEL = () => process.env.TTS_MODEL || "voice";
 const TTS_VOICE = () => process.env.TTS_VOICE || "geffen_32";
 const SUMMARY_MODEL = () => process.env.TTS_SUMMARY_MODEL || "deepseek-v4-flash";
+const TTS_LANGUAGE = () => process.env.TTS_LANGUAGE || "pt-BR";
 const AUTO_SPEAK = () => /^(1|true|yes|on)$/i.test(process.env.TTS_AUTO_SPEAK || "");
 
 // /v1/audio/speech rejects input above 4096 chars; stay under it.
 const MAX_SPEECH_CHARS = 4000;
-
-// Skip the summarizer round-trip for short, code-free replies.
-const DIRECT_SPEAK_MAX_CHARS = 300;
 
 const SUMMARY_PROMPT =
   "Summarize the assistant message below for text-to-speech in 2-3 plain " +
@@ -94,19 +92,15 @@ function lastAssistantMessage(ctx: ExtensionContext): { id: string; text: string
 
 /** Ask Velox for a short spoken-style summary of the reply. */
 async function summarize(text: string, signal: AbortSignal): Promise<string> {
-  if (text.length <= DIRECT_SPEAK_MAX_CHARS && !text.includes("```")) {
-    return text
-      .replace(/```[\s\S]*?```/g, "")
-      .replace(/[*_`#>]|\[|\]\([^)]*\)/g, "")
-      .trim();
-  }
-
   const response = await veloxFetch(
     "/v1/chat/completions",
     {
       model: SUMMARY_MODEL(),
       messages: [
-        { role: "system", content: SUMMARY_PROMPT },
+        {
+          role: "system",
+          content: SUMMARY_PROMPT + " Write the summary in " + TTS_LANGUAGE() + ".",
+        },
         { role: "user", content: text.slice(0, 20000) },
       ],
       max_tokens: 200,
@@ -128,6 +122,7 @@ async function synthesize(input: string, signal: AbortSignal): Promise<Buffer> {
       input,
       voice: TTS_VOICE(),
       response_format: "wav",
+      language: TTS_LANGUAGE(),
     },
     signal,
   );
@@ -330,7 +325,7 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
     return;
   }
 
-  const cacheKey = `${msg.id}:${TTS_MODEL()}:${TTS_VOICE()}:${SUMMARY_MODEL()}`;
+  const cacheKey = `${msg.id}:${TTS_MODEL()}:${TTS_VOICE()}:${SUMMARY_MODEL()}:${TTS_LANGUAGE()}`;
   const controller = new AbortController();
 
   const cachedFile = await getCachedAudio(cacheKey);
