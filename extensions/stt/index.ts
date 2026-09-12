@@ -1,8 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
-import { access, readFile, unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access } from "node:fs/promises";
 import { join } from "node:path";
 
 const DEFAULT_API_URL = "https://velox.josevictor.me";
@@ -10,6 +9,16 @@ const DEFAULT_API_URL = "https://velox.josevictor.me";
 const STT_MODEL = () => process.env.STT_MODEL || "scribe";
 const STT_LANGUAGE = () => process.env.STT_LANGUAGE || "";
 const STT_MAX_SECONDS = () => Number(process.env.STT_MAX_SECONDS) || 120;
+
+const SAMPLE_RATE = 16000;
+const BYTES_PER_SECOND = SAMPLE_RATE * 2; // s16 mono
+const SILENCE_MS = 700; // pause that ends a phrase
+const MAX_SEGMENT_MS = 20_000; // flush anyway if the speaker never pauses
+const MIN_SEGMENT_BYTES = BYTES_PER_SECOND / 2; // 0.5 s
+const SPEECH_RMS = 250; // ~0.8 % full scale
+const METER_SLOTS = 28;
+const METER_INTERVAL_MS = 100;
+const BARS = "▁▂▃▄▅▆▇█";
 
 function apiUrl(): string {
   return (process.env.VELOX_API_URL || DEFAULT_API_URL).replace(/\/+$/, "");
@@ -28,9 +37,10 @@ async function canExecute(bin: string): Promise<boolean> {
   return false;
 }
 
+/** Recorders must write raw s16le mono 16 kHz PCM to stdout. */
 const RECORDER_ARGS: Record<string, string[]> = {
-  "pw-record": ["--rate", "16000", "--channels", "1", "--format", "s16"],
-  ffmpeg: ["-loglevel", "quiet", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", "-y"],
+  "pw-record": ["--raw", "--rate", "16000", "--channels", "1", "--format", "s16", "-"],
+  ffmpeg: ["-loglevel", "quiet", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
 };
 
 /** Resolve the recorder command: STT_RECORDER override, else first available. */
@@ -47,10 +57,10 @@ async function findRecorder(): Promise<{ cmd: string; args: string[] }> {
   throw "no audio recorder found (tried pw-record, ffmpeg)";
 }
 
-/** Start recording into file; rejects early if the binary fails to spawn. */
-function startRecording(cmd: string, args: string[], file: string): Promise<ChildProcess> {
+/** Start recording to stdout; rejects early if the binary fails to spawn. */
+function startRecording(cmd: string, args: string[]): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args.concat(file), { stdio: "ignore" });
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"] });
     child.on("error", (err) => reject("recorder " + cmd + " failed to start: " + String(err)));
     // Once spawned, the process keeps running until stopped.
     child.on("spawn", () => resolve(child));
@@ -72,16 +82,45 @@ function stopRecording(proc: ChildProcess): Promise<void> {
   });
 }
 
-/** Cheap silence guard: >= 0.5 s of audio and a peak above ~1 % full scale. */
-function hasSpeech(buf: Buffer): boolean {
-  if (buf.length <= 44 + 16000 * 2) return false; // shorter than 0.5 s of s16 mono
+/** Peak (for the meter) and RMS (for speech detection) of one PCM chunk. */
+function levels(chunk: Buffer): { peak: number; rms: number } {
   let peak = 0;
-  for (let i = 44; i + 1 < buf.length; i += 4 * 2) {
-    const sample = Math.abs(buf.readInt16LE(i));
-    if (sample > peak) peak = sample;
-    if (peak > 328) return true;
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i + 1 < chunk.length; i += 2) {
+    const sample = chunk.readInt16LE(i);
+    const abs = Math.abs(sample);
+    if (abs > peak) peak = abs;
+    sum += sample * sample;
+    count++;
   }
-  return false;
+  return { peak, rms: count ? Math.sqrt(sum / count) : 0 };
+}
+
+/** Map a peak amplitude onto a block character, -60 dBFS upwards. */
+function bar(peak: number): string {
+  if (peak < 32) return BARS[0];
+  const db = 20 * Math.log10(peak / 32768);
+  const index = Math.round(((db + 60) / 60) * (BARS.length - 1));
+  return BARS[Math.min(BARS.length - 1, Math.max(0, index))];
+}
+
+/** Wrap raw PCM in a 44-byte WAV header. */
+function wav(pcm: Buffer): Buffer {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(SAMPLE_RATE, 24);
+  header.writeUInt32LE(BYTES_PER_SECOND, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
 }
 
 /** Transcribe a wav clip through Velox. Returns trimmed text or throws a string. */
@@ -126,23 +165,110 @@ async function transcribe(buf: Buffer, signal: AbortSignal): Promise<string> {
 
 // --- Session-scoped recording state -----------------------------------------
 
-let rec: {
+interface Recording {
   proc: ChildProcess;
-  file: string;
-  timer: NodeJS.Timeout;
   ctx: ExtensionContext;
-} | undefined;
-let transcribing = false;
+  timer: NodeJS.Timeout;
+  /** PCM of the phrase currently being spoken. */
+  segment: Buffer[];
+  segmentBytes: number;
+  /** Trailing silence inside the current segment. */
+  silenceBytes: number;
+  hadSpeech: boolean;
+  totalBytes: number;
+  meter: string[];
+  lastPaint: number;
+  pending: number;
+  submitted: number;
+  /** Serializes transcription so phrases land in the editor in order. */
+  queue: Promise<void>;
+}
+
+let rec: Recording | undefined;
+let stopping = false;
+
+function ms(bytes: number): number {
+  return (bytes / BYTES_PER_SECOND) * 1000;
+}
+
+function clock(totalBytes: number): string {
+  const secs = Math.floor(totalBytes / BYTES_PER_SECOND);
+  return Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+}
+
+function paint(state: Recording): void {
+  if (rec !== state) return; // recording already torn down
+  state.lastPaint = Date.now();
+  const wave = state.meter.join("").padStart(METER_SLOTS, BARS[0]);
+  const tail = state.pending > 0 ? "  transcribing…" : "";
+  state.ctx.ui.setWidget("stt", ["● " + wave + "  " + clock(state.totalBytes) + tail], {
+    placement: "belowEditor",
+  });
+}
+
+function appendToEditor(ctx: ExtensionContext, text: string): void {
+  const cur = ctx.ui.getEditorText();
+  ctx.ui.setEditorText(cur ? cur.replace(/\s+$/, "") + " " + text : text);
+}
+
+/** Ship the buffered phrase for transcription and start a fresh segment. */
+function flushSegment(state: Recording): void {
+  const pcm = Buffer.concat(state.segment);
+  const speech = state.hadSpeech;
+  state.segment = [];
+  state.segmentBytes = 0;
+  state.silenceBytes = 0;
+  state.hadSpeech = false;
+  if (!speech || pcm.length < MIN_SEGMENT_BYTES) return;
+
+  state.pending++;
+  state.submitted++;
+  paint(state);
+  state.queue = state.queue
+    .then(() => transcribe(wav(pcm), AbortSignal.timeout(120_000)))
+    .then((text) => {
+      if (text) appendToEditor(state.ctx, text);
+    })
+    .catch((err) => {
+      state.ctx.ui.notify("stt: " + String(err), "error");
+    })
+    .finally(() => {
+      state.pending--;
+      paint(state);
+    });
+}
+
+function onChunk(state: Recording, chunk: Buffer): void {
+  if (rec !== state) return;
+  state.totalBytes += chunk.length;
+  state.segment.push(chunk);
+  state.segmentBytes += chunk.length;
+
+  const { peak, rms } = levels(chunk);
+  if (rms >= SPEECH_RMS) {
+    state.hadSpeech = true;
+    state.silenceBytes = 0;
+  } else {
+    state.silenceBytes += chunk.length;
+  }
+
+  state.meter.push(bar(peak));
+  if (state.meter.length > METER_SLOTS) state.meter.shift();
+  if (Date.now() - state.lastPaint >= METER_INTERVAL_MS) paint(state);
+
+  const pause = state.hadSpeech && ms(state.silenceBytes) >= SILENCE_MS;
+  if (pause || ms(state.segmentBytes) >= MAX_SEGMENT_MS) flushSegment(state);
+}
 
 async function toggleDictation(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return; // print/json modes: no-op
 
-  if (transcribing) {
+  if (stopping) {
     ctx.ui.notify("stt: still transcribing", "warning");
     return;
   }
 
-  // Second press stops the recording and transcribes.
+  // Second press stops the recording and transcribes what is left.
   if (rec) {
     await finishRecording();
     return;
@@ -162,64 +288,64 @@ async function toggleDictation(ctx: ExtensionContext): Promise<void> {
     return;
   }
 
-  const file = join(tmpdir(), "pi-stt-" + process.pid + ".wav");
   let proc: ChildProcess;
   try {
-    proc = await startRecording(cmd, args, file);
+    proc = await startRecording(cmd, args);
   } catch (err) {
     ctx.ui.notify("stt: " + String(err), "error");
     return;
   }
 
-  const timer = setTimeout(() => void finishRecording(), STT_MAX_SECONDS() * 1000);
-  rec = { proc, file, timer, ctx };
+  const state: Recording = {
+    proc,
+    ctx,
+    timer: setTimeout(() => void finishRecording(), STT_MAX_SECONDS() * 1000),
+    segment: [],
+    segmentBytes: 0,
+    silenceBytes: 0,
+    hadSpeech: false,
+    totalBytes: 0,
+    meter: [],
+    lastPaint: 0,
+    pending: 0,
+    submitted: 0,
+    queue: Promise.resolve(),
+  };
+  rec = state;
+  proc.stdout?.on("data", (chunk: Buffer) => onChunk(state, chunk));
   ctx.ui.setStatus("stt", "● recording — press again to stop");
+  paint(state);
 }
 
 async function finishRecording(): Promise<void> {
   const state = rec;
   if (!state) return;
-  rec = undefined;
+  stopping = true;
   clearTimeout(state.timer);
-
-  const ctx = state.ctx;
-  transcribing = true;
-  ctx.ui.setStatus("stt", "transcribing…");
 
   try {
     await stopRecording(state.proc);
-    const buf = await readFile(state.file);
-    if (!hasSpeech(buf)) {
-      ctx.ui.notify("stt: nothing recorded", "warning");
-      return;
-    }
-    const text = await transcribe(buf, AbortSignal.timeout(120_000));
-    if (!text) {
-      ctx.ui.notify("stt: empty transcript", "warning");
-      return;
-    }
-    const cur = ctx.ui.getEditorText();
-    ctx.ui.setEditorText(cur ? cur.replace(/\s+$/, "") + " " + text : text);
-  } catch (err) {
-    ctx.ui.notify("stt: " + String(err), "error");
+    flushSegment(state);
+    await state.queue;
+    if (state.submitted === 0) state.ctx.ui.notify("stt: nothing recorded", "warning");
   } finally {
-    await unlink(state.file).catch(() => {});
-    ctx.ui.setStatus("stt", undefined);
-    transcribing = false;
+    rec = undefined;
+    state.ctx.ui.setStatus("stt", undefined);
+    state.ctx.ui.setWidget("stt", undefined);
+    stopping = false;
   }
 }
 
-/** Shutdown cleanup: kill the recorder, abort any in-flight fetch, drop files. */
+/** Shutdown cleanup: kill the recorder and drop the UI. */
 function cancel(): void {
   if (rec) {
     clearTimeout(rec.timer);
     rec.proc.kill("SIGKILL");
-    const file = rec.file;
-    unlink(file).catch(() => {});
     rec.ctx.ui.setStatus("stt", undefined);
+    rec.ctx.ui.setWidget("stt", undefined);
     rec = undefined;
   }
-  transcribing = false;
+  stopping = false;
 }
 
 export default function (pi: ExtensionAPI) {
