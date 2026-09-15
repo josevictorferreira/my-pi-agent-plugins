@@ -290,6 +290,32 @@ async function getAlertSoundFile(): Promise<string> {
   return path;
 }
 
+// --- Speaking indicator -----------------------------------------------------
+
+const WAVE_LEVELS = "▁▂▃▄▅▆▇";
+const WAVE_BARS = 5;
+const WAVE_INTERVAL_MS = 120;
+
+/** One frame of a travelling sine wave, drawn as block bars. */
+function waveFrame(tick: number): string {
+  let frame = "";
+  for (let i = 0; i < WAVE_BARS; i++) {
+    const phase = (tick - i) * 0.7;
+    const level = Math.round(((Math.sin(phase) + 1) / 2) * (WAVE_LEVELS.length - 1));
+    frame += WAVE_LEVELS[level];
+  }
+  return frame;
+}
+
+/** Animate "<wave> Speaking" in the status bar; returns a stop function. */
+function startWave(ctx: ExtensionContext): () => void {
+  let tick = 0;
+  const paint = () => ctx.ui.setStatus("tts", waveFrame(tick++) + " Speaking");
+  paint();
+  const timer = setInterval(paint, WAVE_INTERVAL_MS);
+  return () => clearInterval(timer);
+}
+
 /** Manual trigger: speak the last reply, or stop if already speaking. */
 async function speakLastMessage(ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return; // print/json modes: no-op
@@ -332,14 +358,16 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
   if (cachedFile) {
     const run = { controller, file: cachedFile };
     current = run;
+    let stopWave: (() => void) | undefined;
     try {
-      ctx.ui.setStatus("tts", "▶ speaking");
+      stopWave = startWave(ctx);
       await play(cachedFile, controller.signal);
     } catch (err) {
       if (String(err) !== "aborted" && !controller.signal.aborted) {
         ctx.ui.notify("tts: " + String(err), "error");
       }
     } finally {
+      stopWave?.();
       if (current === run) {
         current = undefined;
         ctx.ui.setStatus("tts", undefined);
@@ -354,6 +382,7 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
   current = run;
 
   let cached = false;
+  let stopWave: (() => void) | undefined;
   try {
     ctx.ui.setStatus("tts", "summarizing…");
     const summary = await summarize(msg.text, controller.signal);
@@ -365,13 +394,14 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
     cacheAudio(cacheKey, file);
     cached = true;
 
-    ctx.ui.setStatus("tts", "▶ speaking");
+    stopWave = startWave(ctx);
     await play(file, controller.signal);
   } catch (err) {
     if (String(err) !== "aborted" && !controller.signal.aborted) {
       ctx.ui.notify("tts: " + String(err), "error");
     }
   } finally {
+    stopWave?.();
     if (!cached) {
       await unlink(file).catch(() => {});
     }
