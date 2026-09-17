@@ -165,8 +165,12 @@ async function findPlayer(): Promise<{ cmd: string; args: string[] }> {
 /** Play an audio file; resolves on close; killed on abort. */
 function play(file: string, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (signal.aborted) return resolve();
     findPlayer()
       .then(({ cmd, args }) => {
+        // A listener added to an already-aborted signal never fires, so the
+        // player would keep going unkillable. Check before spawning.
+        if (signal.aborted) return resolve();
         const child = spawn(cmd, args.concat(file), { stdio: "ignore" });
         const onAbort = () => child.kill("SIGTERM");
         signal.addEventListener("abort", onAbort, { once: true });
@@ -424,7 +428,11 @@ export default function (pi: ExtensionAPI) {
     handler: (ctx) => speakLastMessage(ctx),
   });
 
-  pi.on("agent_settled", (_event, ctx) => autoSpeak(ctx));
+  // Handlers are awaited by the extension runner, and the agent only finishes
+  // settling once they resolve. Speaking must not hold the session hostage.
+  pi.on("agent_settled", (_event, ctx) => {
+    void autoSpeak(ctx).catch(() => {});
+  });
 
   pi.on("session_shutdown", () => {
     stopCurrent();
