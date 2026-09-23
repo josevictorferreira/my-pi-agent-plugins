@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { access, unlink, writeFile } from "node:fs/promises";
 import { unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const DEFAULT_API_URL = "https://velox.josevictor.me";
 
@@ -88,6 +88,11 @@ function lastAssistantMessage(ctx: ExtensionContext): { id: string; text: string
     }
   }
   return undefined;
+}
+
+/** Spoken session label: the /name session name, else the project directory. */
+function sessionLabel(ctx: ExtensionContext): string {
+  return ctx.sessionManager.getSessionName()?.trim() || basename(ctx.cwd);
 }
 
 /** Ask Velox for a short spoken-style summary of the reply. */
@@ -355,7 +360,8 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
     return;
   }
 
-  const cacheKey = `${msg.id}:${TTS_MODEL()}:${TTS_VOICE()}:${SUMMARY_MODEL()}:${TTS_LANGUAGE()}`;
+  const label = sessionLabel(ctx);
+  const cacheKey = `${msg.id}:${label}:${TTS_MODEL()}:${TTS_VOICE()}:${SUMMARY_MODEL()}:${TTS_LANGUAGE()}`;
   const controller = new AbortController();
 
   const cachedFile = await getCachedAudio(cacheKey);
@@ -392,7 +398,7 @@ async function startSpeaking(ctx: ExtensionContext): Promise<void> {
     const summary = await summarize(msg.text, controller.signal);
 
     ctx.ui.setStatus("tts", "synthesizing…");
-    const audio = await synthesize(summary, controller.signal);
+    const audio = await synthesize((label + ". " + summary).slice(0, MAX_SPEECH_CHARS), controller.signal);
 
     await writeFile(file, audio);
     cacheAudio(cacheKey, file);

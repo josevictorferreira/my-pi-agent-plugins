@@ -19,12 +19,14 @@ convenience: no tools, nothing enters the LLM conversation.
 2. The reply is summarized into 2–3 spoken sentences via Velox
    `POST /v1/chat/completions`, written in `TTS_LANGUAGE`, so a reply in
    another language is translated before it is spoken.
-3. Speech is synthesized with Velox `POST /v1/audio/speech` (wav), cached
-   in a temp file keyed by the message ID and configuration, and played
+3. The summary is prefixed with the session label: the name set with
+   `/name`, or the project directory name when the session is unnamed.
+4. Speech is synthesized with Velox `POST /v1/audio/speech` (wav), cached
+   in a temp file keyed by the message ID, session label and configuration, and played
    locally. Re-running `/speak` on the same message reuses the cached audio
    without making summarization or TTS API calls. Cached files are cleaned up on
    session shutdown or process exit.
-4. No-op without a UI (print/json modes). Playback is aborted on
+5. No-op without a UI (print/json modes). Playback is aborted on
    `session_shutdown`.
 
 ## Environment variables
