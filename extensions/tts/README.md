@@ -36,7 +36,7 @@ convenience: no tools, nothing enters the LLM conversation.
 | `VELOX_API_URL` | `https://velox.josevictor.me` | Velox base URL (shared with web-tools) |
 | `VELOX_API_KEY` | — | required bearer token |
 | `TTS_MODEL` | `voice` | speech combo/model alias (velox `[combos.voice]`: speechify-tts, then elevenlabs-tts) |
-| `TTS_VOICE` | `geffen_32` | voice |
+| `TTS_VOICE` | `gwen` | canonical velox combo voice name; velox maps it to a native voice per language (gwen: harper_32 in English, luana in pt-BR). A raw provider id not in the combo table is dropped and falls back to the provider default |
 | `TTS_SUMMARY_MODEL` | `deepseek-v4-flash` | chat model alias for the summary |
 | `TTS_LANGUAGE` | `pt-BR` | spoken language — the summary is written in it and it is sent to the speech endpoint |
 | `TTS_AUTO_SPEAK` | off | `1`/`true` speaks every reply automatically when the agent stops |

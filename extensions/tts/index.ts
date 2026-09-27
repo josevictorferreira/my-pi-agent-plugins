@@ -8,7 +8,7 @@ import { basename, join } from "node:path";
 const DEFAULT_API_URL = "https://velox.josevictor.me";
 
 const TTS_MODEL = () => process.env.TTS_MODEL || "voice";
-const TTS_VOICE = () => process.env.TTS_VOICE || "geffen_32";
+const TTS_VOICE = () => process.env.TTS_VOICE || "gwen";
 const SUMMARY_MODEL = () => process.env.TTS_SUMMARY_MODEL || "deepseek-v4-flash";
 const TTS_LANGUAGE = () => process.env.TTS_LANGUAGE || "pt-BR";
 const AUTO_SPEAK = () => /^(1|true|yes|on)$/i.test(process.env.TTS_AUTO_SPEAK || "");
