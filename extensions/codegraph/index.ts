@@ -1,11 +1,12 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  SessionStartEvent,
+import {
+  isToolCallEventType,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execFile, execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -35,6 +36,18 @@ const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 // failure, so it is relayed as a normal result and the model falls back.
 const NOT_INDEXED_PATTERN =
   /CodeGraph (?:isn't available here|not initialized)|isn't indexed with codegraph|No CodeGraph project is loaded/i;
+
+// A bash command that opens with a text search (after any `cd dir &&` or env
+// assignments). Searches piped out of other commands (`kubectl ... | grep`)
+// don't match: they filter output rather than explore the code.
+const SEARCH_COMMAND_PATTERN =
+  /^(?:\s*cd\s+\S+\s*&&)*\s*(?:\w+=\S*\s+)*(?:grep|egrep|rg|ag|ack|git\s+grep)\b/;
+
+const SEARCH_NUDGE =
+  "Blocked once: this project has a CodeGraph index. Start with codegraph_explore " +
+  "(or codegraph_node for one symbol) instead of grep/rg; it returns the matching " +
+  "source, call paths and dependents in one call. If you need a literal text search " +
+  "(an error message, a config key), run the same command again and it will go through.";
 
 function stripAnsi(text: string): string {
   return text.replace(ANSI_PATTERN, "");
@@ -81,6 +94,51 @@ function findIndexedRoot(cwd: string): string | null {
     if (parent === dir) return null;
     dir = parent;
   }
+}
+
+async function gitRoot(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `.codegraph/.gitignore` un-ignores itself, so a fresh index shows up in
+ * `git status` as untracked (and gets swept in by `git add -A`). The repo-local
+ * `info/exclude` hides it without touching any tracked file.
+ */
+async function excludeFromGit(root: string): Promise<void> {
+  const { stdout } = await execFileAsync("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: root,
+    encoding: "utf-8",
+    timeout: 5000,
+  });
+  const path = resolve(root, stdout.trim());
+  const current = existsSync(path) ? readFileSync(path, "utf-8") : "";
+  if (current.split("\n").some((line) => /^\/?\.codegraph\/?$/.test(line.trim()))) return;
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, (current && !current.endsWith("\n") ? "\n" : "") + ".codegraph\n");
+}
+
+/**
+ * Build the first index of `root`. Detached with no pipes, so quitting pi mid-index
+ * neither kills it nor breaks its output: the index still finishes for the next
+ * session. Resolves with the exit code, or an error message if it never started.
+ */
+function initIndex(bin: string, root: string): Promise<number | string> {
+  return new Promise((done) => {
+    const child = spawn(bin, ["init", root], { cwd: root, detached: true, stdio: "ignore" });
+    child.once("error", (err) => done(err.message));
+    child.once("exit", (code) => done(code ?? 1));
+    child.unref();
+  });
 }
 
 function enabledTools(): Set<string> {
@@ -144,14 +202,80 @@ const PROJECT_PATH_PARAM = Type.Optional(
 
 export default function (pi: ExtensionAPI) {
   let registered = false;
+  // Models trained on bash-first harnesses skip the promptGuidelines and grep
+  // anyway, so the first text search of a session is bounced back once with a
+  // pointer to codegraph. Once per session, so it can never trap the model.
+  let codegraphUsed = false;
+  let nudged = false;
+  let indexing = false;
+
+  pi.on("tool_call", (event) => {
+    if (!registered) return;
+    if (event.toolName.startsWith("codegraph_")) {
+      codegraphUsed = true;
+      return;
+    }
+    if (codegraphUsed || nudged) return;
+    if (!isToolCallEventType("bash", event)) return;
+    if (!SEARCH_COMMAND_PATTERN.test(event.input.command)) return;
+    if (!pi.getActiveTools().includes("codegraph_explore")) return;
+    nudged = true;
+    return { block: true, reason: SEARCH_NUDGE };
+  });
 
   // Registered on session_start rather than at load: ctx.cwd is only available
   // here, and tools that can only answer "not indexed" are not worth their
   // system-prompt budget. A /resume into an indexed project registers then.
+  // An unindexed git repo is indexed in the background and registers when done.
   pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
+    codegraphUsed = false;
+    nudged = false;
+    if (registered || indexing) return;
+    const bin = resolveBin();
+    if (!bin) return;
+    if (findIndexedRoot(ctx.cwd)) {
+      registerTools();
+      return;
+    }
+    if (process.env.CODEGRAPH_AUTO_INIT === "0") return;
+    indexing = true;
+    // Not awaited: session_start handlers block the session, and a first index
+    // of a large repo takes minutes.
+    void autoInit(bin, ctx).finally(() => {
+      indexing = false;
+    });
+  });
+
+  async function autoInit(bin: string, ctx: ExtensionContext): Promise<void> {
+    const root = await gitRoot(ctx.cwd);
+    if (!root || resolve(root) === homedir()) return;
+    // The ctx may be stale by the time a long index finishes (/new, /resume).
+    const notify = (text: string, level: "info" | "warning") => {
+      try {
+        ctx.ui.notify(text, level);
+      } catch {
+        // Session already replaced; the tools still register below.
+      }
+    };
+
+    try {
+      await excludeFromGit(root);
+    } catch {
+      // Not fatal: the index only shows up as untracked.
+    }
+    notify("codegraph: indexing " + root + " in the background", "info");
+    const result = await initIndex(bin, root);
+    if (result !== 0 || !existsSync(join(root, ".codegraph"))) {
+      const reason = typeof result === "string" ? result : "exited with code " + result;
+      notify("codegraph: init " + reason + "; run `codegraph init` in " + root + " to see why", "warning");
+      return;
+    }
     if (registered) return;
-    if (!resolveBin()) return;
-    if (!findIndexedRoot(ctx.cwd)) return;
+    registerTools();
+    notify("codegraph: index ready, codegraph tools enabled", "info");
+  }
+
+  function registerTools(): void {
     registered = true;
 
     const enabled = enabledTools();
@@ -409,5 +533,5 @@ export default function (pi: ExtensionAPI) {
         },
       });
     }
-  });
+  }
 }

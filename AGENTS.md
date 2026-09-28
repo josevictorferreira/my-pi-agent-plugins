@@ -85,13 +85,13 @@ The package has 17 TypeScript source files and no tests. Reference counts below 
 ## ANTI-PATTERNS (THIS PROJECT)
 - Do not add a build step: pi loads TypeScript directly through jiti; `bun run check` is typechecking only.
 - Do not add per-plugin package manifests or dependencies unless the pi package model changes deliberately.
-- Do not make CodeGraph initialize, index, or sync a project. It only shells out to an already available CLI/index and must fall back normally when CodeGraph is unavailable.
+- Do not let the model initialize, index, or sync a CodeGraph project, and do not block `session_start` on indexing. The only indexing is the extension's background auto-init of an unindexed git repo (opt out with `CODEGRAPH_AUTO_INIT=0`); without a CLI it must fall back normally.
 - Do not auto-install external binaries or restart failed language servers; LSP server availability is environment-owned and failures remain bounded to the session.
 - Do not surface optional memory-ingestion failures as session errors; Hindsight retention is fire-and-forget.
 - Do not expose secrets in tool output or commit API tokens/configuration.
 
 ## UNIQUE STYLES
-- CodeGraph tools register only at `session_start` when both a resolvable CLI and an ancestor `.codegraph/` index exist; default tools are `explore,node`, with others opt-in through `CODEGRAPH_TOOLS`.
+- CodeGraph tools register at `session_start` when both a resolvable CLI and an ancestor `.codegraph/` index exist, or once a detached background `codegraph init` of the git root finishes (which also adds `.codegraph` to `.git/info/exclude`); default tools are `explore,node`, with others opt-in through `CODEGRAPH_TOOLS`. A `tool_call` hook blocks the session's first bash `grep`/`rg`/`git grep` once, until any `codegraph_*` tool has run.
 - Hindsight derives a bank per git project, skips extension inputs/slash commands/trivial prompts, and stores only user prompts plus the final assistant response.
 - LSP starts one stdio client per `(server, root)` lazily on first matching file touch; automatic edit/write feedback reports only severity-1 diagnostics, capped at 20 per file.
 - Web-tools and Context7 are thin HTTP adapters. Their README files are the source of truth for endpoint contracts and exposed parameters.
