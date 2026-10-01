@@ -100,7 +100,7 @@ export const BUILTIN_TYPES: Record<string, SubagentType> = {
 };
 
 export const BASE_PROMPT =
-  "You are a {type} subagent launched by another agent, not by a person. Your task is the first user " +
+  "You are a subagent of type \"{type}\", launched by another agent, not by a person. Your task is the first user " +
   "message. Work only on that task in this repository. Each time you stop, the whole of your final " +
   "message is delivered verbatim to the launching agent, which has not seen your tool calls, so make it " +
   "self-contained: what you found or did, exact file paths, and anything it must decide. Do not ask for " +
