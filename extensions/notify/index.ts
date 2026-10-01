@@ -134,6 +134,9 @@ async function notifySettled(pi: ExtensionAPI, ctx: ExtensionContext): Promise<v
 }
 
 export default function (pi: ExtensionAPI) {
+	// A subagent pane (see extensions/subagents) settles once per delegated turn;
+	// its results reach the launcher, not the desktop.
+	if (process.env.PI_SUBAGENT_TASK) return;
 	pi.on("agent_settled", (_event, ctx) => {
 		void notifySettled(pi, ctx).catch(() => {});
 	});

@@ -24,6 +24,9 @@ const USER_BANK = process.env.HINDSIGHT_USER_BANK || "pi-agent-user";
 // need not decide to call hindsight_recall. Budget is per bank (two banks) and
 // paid on every prompt, so keep it small.
 const AUTO_RECALL = process.env.HINDSIGHT_AUTO_RECALL === "1";
+// Subagent panes (extensions/subagents) work on delegated prompts; those are
+// not the user's own prompts and must not be retained as memories.
+const IN_SUBAGENT = !!process.env.PI_SUBAGENT_TASK;
 const AUTO_RECALL_MAX_TOKENS = 300;
 
 // Auto-retention filters: skip trivial prompts ("ok", "yes", "continue") and
@@ -309,7 +312,7 @@ export default function (pi: ExtensionAPI) {
     const text = event.text.trim();
     // Extension-injected inputs aren't "my own prompts"; slash commands and
     // trivial confirmations aren't worth remembering.
-    if (event.source === "extension") return undefined;
+    if (IN_SUBAGENT || event.source === "extension") return undefined;
     if (!text || text.startsWith("/") || text.length < MIN_PROMPT_CHARS) return undefined;
     pendingPrompts.push(text.slice(0, MAX_ITEM_CHARS));
     sessionTurns.push("User: " + text.slice(0, MAX_ITEM_CHARS));
@@ -368,6 +371,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
+    if (IN_SUBAGENT) return;
     const assistantMessages = event.messages.filter((m: any) => m?.role === "assistant");
     const finalMessage = assistantMessages[assistantMessages.length - 1];
     const finalText = messageText(finalMessage);
@@ -436,6 +440,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event: AgentSettledEvent, ctx: ExtensionContext) => {
+    if (IN_SUBAGENT) return;
     scheduleRetrospective(ctx);
   });
 

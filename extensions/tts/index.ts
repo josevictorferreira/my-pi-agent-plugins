@@ -437,6 +437,8 @@ export default function (pi: ExtensionAPI) {
   // Handlers are awaited by the extension runner, and the agent only finishes
   // settling once they resolve. Speaking must not hold the session hostage.
   pi.on("agent_settled", (_event, ctx) => {
+    // Subagent panes (extensions/subagents) report to their launcher, not aloud.
+    if (process.env.PI_SUBAGENT_TASK) return;
     void autoSpeak(ctx).catch(() => {});
   });
 
