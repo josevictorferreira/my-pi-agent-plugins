@@ -13,6 +13,7 @@ Custom extensions for the [pi coding agent](https://github.com/badlogic/pi-mono)
 | [lsp](extensions/lsp/) | Language server integration: compiler errors appended to `edit`/`write` results, plus an `lsp` tool for hover, definitions, references, symbols and diagnostics |
 | [notify](extensions/notify/) | Desktop notifications when a run settles: one `notify-send`-style popup classifying the last assistant reply as done, question or error (aborts stay silent); `NOTIFY_COMMAND`/`NOTIFY_TITLE`/`NOTIFY_ENABLED` env vars, works in `-p` and the TUI |
 | [skill-state](extensions/skill-state/) | `/state-run <objective>`: executes a long-horizon SE task with the SKILL.state runtime (arXiv:2608.26263): frozen spec + bounded JSON state + latest observation only, so per-step prompt size is constant and cumulative tokens are linear in steps. `/state-resume` continues a failed run, `/state-log` shows the per-run traces under `~/.pi/agent/skill-state/`, `/state-cancel` aborts |
+| [subagents](extensions/subagents/) | Delegate to **explorer / researcher / worker / oracle** subagents: each is a separate interactive `pi` in its own tmux pane (session `pi-<id8>`), and every finished turn interrupts the launcher with a `subagent-result` message. Tools `subagent_launch`, `subagent_check`, `subagent_send`, `subagent_close`; `/subagents [--all]` lists the launch tree. Per-type model, fallback model, prompt, tools and skills via `~/.pi/agent/subagents/<type>.md` |
 
 
 ## New Plugins
